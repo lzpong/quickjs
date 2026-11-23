@@ -68,7 +68,7 @@ declare module "std" {
 		 * Write `length` bytes to the file from the ArrayBuffer `buffer` at
 		 * byte position position (wrapper to the libc `fwrite`).
 		 */
-		write(buffer: ArrayBuffer, postion: number, length: number): number;
+		write(buffer: ArrayBuffer, position: number, length: number): number;
 		/**
 		 * Return the next line from the file, assuming UTF-8 encoding, excluding
 		 * the trailing line feed.

@@ -14,6 +14,7 @@ declare module "os" {
 	type SocketFamily = Branded<number, "SocketFamily">;
 	type SocketType = Branded<number, "SocketType">;
 	type SocketOpt = Branded<number, "SocketOpt">;
+	type SocketLevel = Branded<number, "SocketLevel">;
 	type SocketShutOpt = Branded<number, "SocketShutOpt">;
 	type PollOpt = Branded<number, "PollOpt">;
 	type PollRet = Branded<number, "PollRet">;
@@ -138,9 +139,28 @@ declare module "os" {
 	export const SOCK_DGRAM: SocketType;
 	export const SOCK_RAW: SocketType;
 	//export const SOCK_BLOCK: SocketType; // SOCK_NONBLOCK
+	export const SOL_SOCKET: SocketLevel;
 	export const SO_REUSEADDR: SocketOpt;
 	export const SO_ERROR: SocketOpt;
 	export const SO_RCVBUF: SocketOpt;
+	export const SO_SNDBUF: SocketOpt;
+	export const SO_KEEPALIVE: SocketOpt;
+	export const SO_BROADCAST: SocketOpt;
+	export const IPPROTO_IP: SocketLevel;
+	export const IPPROTO_TCP: SocketLevel;
+	export const IPPROTO_UDP: SocketLevel;
+	export const IPPROTO_IPV6: SocketLevel;
+	export const TCP_NODELAY: SocketOpt;
+	export const IP_ADD_MEMBERSHIP: SocketOpt;
+	export const IP_DROP_MEMBERSHIP: SocketOpt;
+	export const IP_MULTICAST_IF: SocketOpt;
+	export const IP_MULTICAST_TTL: SocketOpt;
+	export const IP_MULTICAST_LOOP: SocketOpt;
+	export const IPV6_JOIN_GROUP: SocketOpt;
+	export const IPV6_LEAVE_GROUP: SocketOpt;
+	export const IPV6_MULTICAST_IF: SocketOpt;
+	export const IPV6_MULTICAST_HOPS: SocketOpt;
+	export const IPV6_MULTICAST_LOOP: SocketOpt;
 	export const SHUT_RD: SocketShutOpt;
 	export const SHUT_WR: SocketShutOpt;
 	export const SHUT_RDWR: SocketShutOpt;
@@ -165,14 +185,14 @@ declare module "os" {
 	export function ttySetRaw(fd: FileDescriptor): void;
 	/** Remove a file. */
 	export function remove(filename: string): Result<Success>;
-	/** Rename a file. */
-	export function rename(filename: string): Result<Success>;
+	/** Rename a file from `oldpath` to `newpath`. */
+	export function rename(oldpath: string, newpath: string): Result<Success>;
 	/** Get the canonicalized absolute pathname of `path` */
 	export function realpath(path: string): [absPath: string, code: Success | Errno];
 	/** Return the current working directory */
 	export function getcwd(): [cwd: string, code: Success | Errno];
-	/** Change the current directory. Return 0 if OK or `-errno`. */
-	export function chdir(): Result<Success>;
+	/** Change the current directory to `path`. Return 0 if OK or `-errno`. */
+	export function chdir(path: string): Result<Success>;
 	/** Create a directory at `path`. Return 0 if OK or `-errno`. */
 	export function mkdir(path: string, mode?: number): Result<Success>;
 	/** Get a file status */
@@ -187,11 +207,11 @@ declare module "os" {
 	export function readlink(path: string): [linkTarget: string, code: Success | Errno];
 	/** List directory entries */
 	export function readdir(dirPath: string): [dirFilenames: string[], code: Success | Errno];
-	/** Set the single `func` read handler to be called each time data can be written to `fd`. */
+	/** Set the single `func` read handler to be called each time data can be read from `fd`. */
 	export function setReadHandler(fd: FileDescriptor, func: Callback): void;
 	/** Remove the read handler for `fd`. */
 	export function setReadHandler(fd: FileDescriptor, func: null): void;
-	/** Set the single `func` read handler to be called each time data can be written to `fd`. */
+	/** Set the single `func` write handler to be called each time data can be written to `fd`. */
 	export function setWriteHandler(fd: FileDescriptor, func: Callback): void;
 	/** Remove the write handler for `fd`. */
 	export function setWriteHandler(fd: FileDescriptor, func: null): void;
@@ -210,7 +230,7 @@ declare module "os" {
 	/** `waitpid` Unix system call. */
 	export function waitpid(pid: Pid, options: WaitpidOpt): [ret: Result<Pid | Success>, status: WaitStatus];
 	/** `getpid` Unix system call. */
-	export function getpid(): [Pid];
+	export function getpid(): Result<Pid>;
 	/** `dup` Unix system call. */
 	export function dup(fd: FileDescriptor): Result<FileDescriptor>;
 	/** `dup2` Unix system call. */
@@ -225,34 +245,36 @@ declare module "os" {
 	export function setTimeout(func: Callback, delay: number): TimerHandle;
 	/** Cancel a timer. */
 	export function clearTimeout(handle: TimerHandle): void;
-	/** Create a POSIX socket */
-	export function socket(family: SocketFamily, type: SocketType): Result<FileDescriptor>;
-	/** Get a socket option @example os.getsockopt(sock_srv, os.SO_RCVBUF, uintArr1.buffer); */
-	export function getsockopt(sockfd: FileDescriptor, name: SocketOpt, data: ArrayBuffer): Result<Success>;
-	/** Set a socket option @example os.setsockopt(sock_srv, os.SO_REUSEADDR, new Uint32Array([1]).buffer); */
-	export function setsockopt(sockfd: FileDescriptor, name: SocketOpt, data: ArrayBuffer): Result<Success>;
+	/** Create a non-blocking socket. `protocol` defaults to 0. */
+	export function socket(family: SocketFamily, type: SocketType, protocol?: number): Result<FileDescriptor>;
+	/** Get a socket option into `data`. Returns the number of bytes written (>=0) or `-errno`. `level` defaults to `SOL_SOCKET`. @example os.getsockopt(sock, os.SO_RCVBUF, new Uint32Array(1).buffer) */
+	export function getsockopt(sockfd: FileDescriptor, name: SocketOpt, data: ArrayBuffer, level?: SocketLevel): Result<number>;
+	/** Set a socket option from `data`. `level` defaults to `SOL_SOCKET`. @example os.setsockopt(sock, os.SO_REUSEADDR, new Uint32Array([1]).buffer) */
+	export function setsockopt(sockfd: FileDescriptor, name: SocketOpt, data: ArrayBuffer, level?: SocketLevel): Result<Success>;
 	/** Get address information for a given node and/or service @example os.getaddrinfo("localhost", {family:os.AF_INET6}) */
-	export function getaddrinfo(node?: string, hint?: HintAddr): Result<Array<SocketAddrInfo>>;
+	export function getaddrinfo(node: string, hint?: HintAddr): Result<Array<SocketAddrInfo>>;
 	/** Get current address to which the socket sockfd is bound */
 	export function getsockname(sockfd: FileDescriptor): Result<SocketAddr>;
+	/** Get address of the peer connected to the socket sockfd */
+	export function getpeername(sockfd: FileDescriptor): Result<SocketAddr>;
 	/** Bind socket to a specific address */
 	export function bind(sockfd: FileDescriptor, addr: SocketAddr): Result<Success>;
 	/** Mark `sockfd` as passive socket that will `accept()` a `backlog` number of incoming connection (SOMAXCONN by default). */
 	export function listen(sockfd: FileDescriptor, backlog?: number): Result<Success>;
 	/** Shut down part of a full-duplex connection */
 	export function shutdown(sockfd: FileDescriptor, type: SocketShutOpt): Result<Success>;
-	/** Accept incoming connections */
+	/** Accept incoming connections. Resolves `[remotefd, remoteaddr]`, rejects with `-errno` on error. */
 	export function accept(sockfd: FileDescriptor): Promise<[remotefd: FileDescriptor, remoteaddr: SocketAddr]>;
-	/** Connect `sockfd` to `addr` */
-	export function connect(sockfd: FileDescriptor, addr: SocketAddr): Promise<Result<Success>>;
-	/** Send `length` byte from `buffer` on `sockfd` @returns bytes sent or <0 if error */
-	export function send(sockfd: FileDescriptor, buffer: ArrayBuffer, length?: number): Promise<Result<number>>;
-	/** Receive `length` byte in `buffer` from `sockfd` @returns bytes received or <0 if error */
-	export function recv(sockfd: FileDescriptor, buffer: ArrayBuffer, length?: number): Promise<Result<number>>;
-	/** Send `length` byte from `buffer` on `sockfd` to `addr` @returns bytes sent or <0 if error */
-	export function sendto(sockfd: FileDescriptor, addr: SocketAddr, buffer: ArrayBuffer, length?: number): Promise<Result<number>>;
-	/** Receive `length` byte in `buffer` from `sockfd` @returns bytes received or <0 if error, and remote address used */
-	export function recvfrom(sockfd: FileDescriptor, buffer: ArrayBuffer, length?: number): Promise<[total: Result<number>, from: SocketAddr]>;
+	/** Connect `sockfd` to `addr`. Resolves 0 on success, rejects with `-errno` on error. */
+	export function connect(sockfd: FileDescriptor, addr: SocketAddr): Promise<Success>;
+	/** Send up to `length` bytes from `buffer` (starting at byte `offset`) on `sockfd`. Resolves bytes sent, rejects with `-errno` on error. */
+	export function send(sockfd: FileDescriptor, buffer: ArrayBuffer, length?: number, offset?: number): Promise<number>;
+	/** Receive up to `length` bytes into `buffer` (starting at byte `offset`) from `sockfd`. Resolves bytes received (0 on EOF), rejects with `-errno` on error. */
+	export function recv(sockfd: FileDescriptor, buffer: ArrayBuffer, length?: number, offset?: number): Promise<number>;
+	/** Send up to `length` bytes from `buffer` (starting at byte `offset`) on `sockfd` to `addr`. Resolves bytes sent, rejects with `-errno` on error. */
+	export function sendto(sockfd: FileDescriptor, addr: SocketAddr, buffer: ArrayBuffer, length?: number, offset?: number): Promise<number>;
+	/** Receive up to `length` bytes into `buffer` (starting at byte `offset`) from `sockfd`. Resolves `[bytesReceived, remoteAddr]`, rejects with `-errno` on error. */
+	export function recvfrom(sockfd: FileDescriptor, buffer: ArrayBuffer, length?: number, offset?: number): Promise<[total: number, from: SocketAddr]>;
 
 	export class Worker {
 		/**
@@ -285,6 +307,6 @@ declare module "os" {
 		 * message. The thread is not terminated if there is at least one non
 		 * `null` onmessage handler.
 		 */
-		onmessage: (msg: WorkerMessage) => void;
+		onmessage: ((event: { data: WorkerMessage }) => void) | null;
 	}
 }

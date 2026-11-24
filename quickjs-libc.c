@@ -3527,8 +3527,10 @@ static int js_os_poll(JSContext *ctx)
 #endif /* !_WIN32 */
 
 /* Build a SocketAddrInfo[] JS array from a getaddrinfo result chain.
-   Shared by the synchronous getaddrinfo and the async resolver drain. */
-static JSValue js_build_addrinfo_array(JSContext *ctx, struct addrinfo *ai)
+   Shared by the synchronous getaddrinfo and the async resolver drain.
+   canonname is exposed only when the caller's ai_flags request AI_CANONNAME. */
+static JSValue js_build_addrinfo_array(JSContext *ctx, struct addrinfo *ai,
+                                       int ai_flags)
 {
     JSValue arr = JS_NewArray(ctx);
     struct addrinfo *it;
@@ -3569,7 +3571,8 @@ static JSValue js_build_addrinfo_array(JSContext *ctx, struct addrinfo *ai)
             ip_ptr ? JS_NewString(ctx, ip_ptr) : JS_NULL, JS_PROP_C_W_E);
         JS_DefinePropertyValueStr(ctx, obj, "port", JS_NewUint32(ctx, ntohs(sin_port)), JS_PROP_C_W_E);
         JS_DefinePropertyValueStr(ctx, obj, "canonname",
-            it->ai_canonname ? JS_NewString(ctx, it->ai_canonname) : JS_NULL, JS_PROP_C_W_E);
+            (ai_flags & AI_CANONNAME) && it->ai_canonname ? JS_NewString(ctx, it->ai_canonname) : JS_NULL,
+            JS_PROP_C_W_E);
         JS_DefinePropertyValueUint32(ctx, arr, idx++, obj, JS_PROP_C_W_E);
     }
     return arr;
@@ -3704,7 +3707,7 @@ static void js_resolver_drain(JSContext *ctx)
         if (req->err != 0) {
             result = JS_NewInt32(ctx, req->err);
         } else if (req->type == 0) {
-            result = js_build_addrinfo_array(ctx, req->ai);
+            result = js_build_addrinfo_array(ctx, req->ai, req->hints.ai_flags);
             if (JS_IsException(result)) {
                 JS_FreeValue(ctx, JS_GetException(ctx));
                 result = JS_NewInt32(ctx, -ENOMEM);
@@ -5437,7 +5440,7 @@ static JSValue js_os_getaddrinfo(JSContext *ctx, JSValueConst this_val,
     if (ret != 0) {
         arr = JS_NewInt32(ctx, js_eai_norm(ret));
     } else {
-        arr = js_build_addrinfo_array(ctx, ai);
+        arr = js_build_addrinfo_array(ctx, ai, hints.ai_flags);
     }
     /* free the whole chain via the head pointer on both paths */
     if (ai)

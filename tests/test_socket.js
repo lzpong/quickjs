@@ -351,23 +351,31 @@ async function test_args() {
 }
 
 async function main() {
-    test_inet();
-    test_gethostname();
-    await test_getaddrinfo();
-    await test_getnameinfo();
-    await test_socketpair();
-    await test_tcp();
-    await test_udp();
-    await test_msg_flags();
-    await test_multicast();
-    await test_close_cancel();
-    await test_args();
+    const tests = [
+        ["inet", test_inet],
+        ["gethostname", test_gethostname],
+        ["getaddrinfo", test_getaddrinfo],
+        ["getnameinfo", test_getnameinfo],
+        ["socketpair", test_socketpair],
+        ["tcp", test_tcp],
+        ["udp", test_udp],
+        ["msg_flags", test_msg_flags],
+        ["multicast", test_multicast],
+        ["close_cancel", test_close_cancel],
+        ["args", test_args],
+    ];
+    for (const [name, fn] of tests) {
+        console.log("RUN:", name);
+        await fn();
+    }
 }
 
 main().then(() => {
     os.clearTimeout(watchdog);
     /* all sockets closed and no pending ops: the loop drains and exits 0 */
 }, (e) => {
-    console.log("FAIL: test_socket.js:", e && e.stack ? e.stack : e);
+    console.log("FAIL: test_socket.js:", e && e.message ? e.message : e);
+    if (e && e.stack)
+        console.log(e.stack);
     std.exit(1);
 });

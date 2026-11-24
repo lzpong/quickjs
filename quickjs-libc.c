@@ -2929,8 +2929,8 @@ static int handle_posted_message(JSRuntime *rt, JSContext *ctx,
 #endif /* !USE_WORKER */
 
 /* Dispatch one ready pending socket operation. js_os_poll() calls this when
-   the operation's pollfd reports revents != 0. Shared by POSIX poll() and
-   Win WSAPoll(); the readiness mask is chosen by magic in js_os_poll(). */
+   the operation's pollfd reports readiness for its magic (or an error flag).
+   Shared by POSIX poll() and Win WSAPoll(). */
 static void handle_socket_message(JSContext *ctx, JSOSSockHandler *sh)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
@@ -3069,10 +3069,20 @@ static no_inline int js_poll_expand(JSThreadState *ts)
     return 0;
 }
 
+/* Add fd to the poll array, or reuse an existing entry for the same fd
+   (OR-ing the events). Returns the entry index, or -1 on error. Keeping fds
+   unique matters because macOS poll() reports revents on only one of several
+   duplicate-fd entries, which would otherwise dispatch handlers out of order. */
 static int js_poll_add_poll_fd(JSThreadState *ts, int *pnfds, intptr_t fd, int events)
 {
     js_pollfd *fds;
-    int nfds = *pnfds;
+    int i, nfds = *pnfds;
+    for (i = 0; i < nfds; i++) {
+        if (ts->poll_fds[i].fd == JS_SOCK(fd)) {
+            ts->poll_fds[i].events |= events;
+            return i;
+        }
+    }
     if (unlikely(nfds >= ts->poll_fds_size)) {
         if (js_poll_expand(ts))
             return -1;
@@ -3082,7 +3092,7 @@ static int js_poll_add_poll_fd(JSThreadState *ts, int *pnfds, intptr_t fd, int e
     fds->events = events;
     fds->revents = 0;
     *pnfds = nfds;
-    return 0;
+    return nfds - 1;
 }
 
 /* readiness mask for a pending socket operation; CONNECT watches both
@@ -3288,16 +3298,16 @@ static int js_os_poll(JSContext *ctx)
     nfds = 0;
     list_for_each(el, &ts->os_sock_handlers) {
         JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
-        sh->poll_fd_index = nfds;
-        if (js_poll_add_poll_fd(ts, &nfds, sh->sockfd, js_sock_poll_events(sh->magic)))
+        sh->poll_fd_index = js_poll_add_poll_fd(ts, &nfds, sh->sockfd, js_sock_poll_events(sh->magic));
+        if (sh->poll_fd_index < 0)
             return -1;
     }
 
     list_for_each(el, &ts->port_list) {
         JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
         if (!JS_IsNull(port->on_message_func)) {
-            port->poll_fd_index = nfds;
-            if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(port->recv_pipe->waker), POLLIN))
+            port->poll_fd_index = js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(port->recv_pipe->waker), POLLIN);
+            if (port->poll_fd_index < 0)
                 return -1;
         }
     }
@@ -3308,8 +3318,8 @@ static int js_os_poll(JSContext *ctx)
         list_for_each(el, &ts->os_rw_handlers) {
             rh = list_entry(el, JSOSRWHandler, link);
             if (rh->fd == 0 && !JS_IsNull(rh->rw_func[0])) {
-                stdin_fd_index = nfds;
-                if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->stdin_state->waker), POLLIN))
+                stdin_fd_index = js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->stdin_state->waker), POLLIN);
+                if (stdin_fd_index < 0)
                     return -1;
                 break;
             }
@@ -3318,20 +3328,21 @@ static int js_os_poll(JSContext *ctx)
 
     resolver_fd_index = -1;
     if (ts->resolver.started) {
-        resolver_fd_index = nfds;
-        if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->resolver.waker), POLLIN))
+        resolver_fd_index = js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->resolver.waker), POLLIN);
+        if (resolver_fd_index < 0)
             return -1;
     }
 
-    atomics_fd_index = nfds;
-    if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->atomics_async_waker), POLLIN))
+    atomics_fd_index = js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->atomics_async_waker), POLLIN);
+    if (atomics_fd_index < 0)
         return -1;
 
     nfds = WSAPoll(ts->poll_fds, nfds, min_delay);
     if (nfds > 0) {
         list_for_each(el, &ts->os_sock_handlers) {
             JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
-            if (ts->poll_fds[sh->poll_fd_index].revents != 0) {
+            int re = ts->poll_fds[sh->poll_fd_index].revents;
+            if (re & (js_sock_poll_events(sh->magic) | POLLERR | POLLHUP | POLLNVAL)) {
                 handle_socket_message(ctx, sh);
                 /* must stop because the list may have been modified */
                 goto done;
@@ -3441,37 +3452,37 @@ static int js_os_poll(JSContext *ctx)
         if (!JS_IsNull(rh->rw_func[1]))
             events |= POLLOUT;
         if (events) {
-            rh->poll_fd_index = nfds;
-            if (js_poll_add_poll_fd(ts, &nfds, rh->fd, events))
+            rh->poll_fd_index = js_poll_add_poll_fd(ts, &nfds, rh->fd, events);
+            if (rh->poll_fd_index < 0)
                 return -1;
         }
     }
 
     list_for_each(el, &ts->os_sock_handlers) {
         JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
-        sh->poll_fd_index = nfds;
-        if (js_poll_add_poll_fd(ts, &nfds, sh->sockfd, js_sock_poll_events(sh->magic)))
+        sh->poll_fd_index = js_poll_add_poll_fd(ts, &nfds, sh->sockfd, js_sock_poll_events(sh->magic));
+        if (sh->poll_fd_index < 0)
             return -1;
     }
 
     list_for_each(el, &ts->port_list) {
         JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
         if (!JS_IsNull(port->on_message_func)) {
-            port->poll_fd_index = nfds;
-            if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(port->recv_pipe->waker), POLLIN))
+            port->poll_fd_index = js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(port->recv_pipe->waker), POLLIN);
+            if (port->poll_fd_index < 0)
                 return -1;
         }
     }
 
     resolver_fd_index = -1;
     if (ts->resolver.started) {
-        resolver_fd_index = nfds;
-        if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->resolver.waker), POLLIN))
+        resolver_fd_index = js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->resolver.waker), POLLIN);
+        if (resolver_fd_index < 0)
             return -1;
     }
 
-    atomics_fd_index = nfds;
-    if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->atomics_async_waker), POLLIN))
+    atomics_fd_index = js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->atomics_async_waker), POLLIN);
+    if (atomics_fd_index < 0)
         return -1;
 
     nfds = poll(ts->poll_fds, nfds, min_delay);
@@ -3494,7 +3505,8 @@ static int js_os_poll(JSContext *ctx)
 
         list_for_each(el, &ts->os_sock_handlers) {
             JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
-            if (ts->poll_fds[sh->poll_fd_index].revents != 0) {
+            int re = ts->poll_fds[sh->poll_fd_index].revents;
+            if (re & (js_sock_poll_events(sh->magic) | POLLERR | POLLHUP | POLLNVAL)) {
                 handle_socket_message(ctx, sh);
                 /* must stop because the list may have been modified */
                 goto done;

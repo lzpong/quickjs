@@ -233,13 +233,21 @@ async function test_msg_flags() {
         assert(await os.send(b, msg, 10), 10);
         /* let the bytes land so MSG_WAITALL completes without blocking */
         await os.sleepAsync(50);
-        /* PEEK reads without consuming */
+        /* Probe each flag independently (PEEK never consumes the bytes), so a
+           single run reports both outcomes even if one or both reject. */
         const pb = new ArrayBuffer(10);
-        assert(await os.recv(a, pb, 10, 0, os.MSG_PEEK), 10);
-        assert(bufToStr(pb, 10), "0123456789");
-        /* WAITALL still sees all 10 bytes (peek did not consume them) */
+        let pn;
+        try { pn = await os.recv(a, pb, 10, 0, os.MSG_PEEK); }
+        catch (e) { pn = "throw " + e; console.log(e.message,e.stack); }
+        console.log("MSG_PEEK:", pn, "data:", bufToStr(pb, 10));
         const wb = new ArrayBuffer(10);
-        assert(await os.recv(a, wb, 10, 0, os.MSG_WAITALL), 10);
+        let wn;
+        try { wn = await os.recv(a, wb, 10, 0, os.MSG_WAITALL); }
+        catch (e) { wn = "throw " + e; console.log(e.message,e.stack); }
+        console.log("MSG_WAITALL:", wn, "data:", bufToStr(wb, 10));
+        assert(pn, 10);
+        assert(bufToStr(pb, 10), "0123456789");
+        assert(wn, 10);
         assert(bufToStr(wb, 10), "0123456789");
     } finally {
         os.close(a);

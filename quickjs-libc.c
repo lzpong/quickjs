@@ -271,6 +271,11 @@ static int (*os_poll_func)(JSContext *ctx);
 
 /* drain completed async DNS requests on the main thread (defined later) */
 static void js_resolver_drain(JSContext *ctx);
+/* socket registry/close helpers used by os.close() (defined later) */
+static void js_sock_close(intptr_t handle);
+static JSOSockHandle *js_os_sock_lookup(JSThreadState *ts, intptr_t handle);
+static void js_os_sock_unregister(JSRuntime *rt, intptr_t handle);
+static void js_os_sock_cancel(JSContext *ctx, intptr_t sockfd);
 #if defined(_WIN32)
 /* stdin is not a socket: a helper thread backs os.read(0) (defined later) */
 static int js_stdin_start(JSThreadState *ts);

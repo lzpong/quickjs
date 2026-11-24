@@ -269,7 +269,9 @@ QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
 
 HOST_LIBS=-lm -ldl -lpthread
 LIBS=-lm -lpthread
-ifndef CONFIG_WIN32
+ifdef CONFIG_WIN32
+LIBS+=-lws2_32
+else
 LIBS+=-ldl
 endif
 LIBS+=$(EXTRA_LIBS)
@@ -474,6 +476,7 @@ test: qjs$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_bigint.js
 	$(WINE) ./qjs$(EXE) tests/test_cyclic_import.js
 	$(WINE) ./qjs$(EXE) tests/test_worker.js
+	$(WINE) ./qjs$(EXE) tests/test_socket.js
 ifndef CONFIG_WIN32
 	$(WINE) ./qjs$(EXE) tests/test_std.js
 	$(WINE) ./qjs$(EXE) tests/test_rw_handler.js

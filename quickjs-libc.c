@@ -38,6 +38,12 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #if defined(_WIN32)
+/* winsock2.h must precede windows.h; WSAPoll needs Vista+ */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <conio.h>
 #include <utime.h>
@@ -46,6 +52,13 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <poll.h>
 
 #if defined(__FreeBSD__)
@@ -81,9 +94,34 @@ typedef sig_t sighandler_t;
 #define PATH_MAX 4096
 #endif
 
-/* TODO:
-   - add socket calls
-*/
+#if !defined(ECANCELED)
+#define ECANCELED 125
+#endif
+
+/* unified pollfd type: POSIX poll() / Win WSAPoll() share the dispatch logic */
+#if defined(_WIN32)
+typedef WSAPOLLFD js_pollfd;
+#define JS_SOCK(fd) ((SOCKET)(fd))
+/* Winsock recv/send take an int length */
+#define JS_SOCK_LEN(n) ((int)((n) > INT_MAX ? INT_MAX : (n)))
+#define JS_WAKER_READ_FD(w) ((intptr_t)(w).read_sock)
+#define JS_EAGAIN WSAEWOULDBLOCK
+#else
+typedef struct pollfd js_pollfd;
+#define JS_SOCK(fd) ((int)(fd))
+#define JS_SOCK_LEN(n) ((size_t)(n))
+#define JS_WAKER_READ_FD(w) ((intptr_t)(w).read_fd)
+#define JS_EAGAIN EAGAIN
+#endif
+
+typedef enum {
+    MAGIC_SOCKET_RECV,
+    MAGIC_SOCKET_SEND,
+    MAGIC_SOCKET_RECVFROM,
+    MAGIC_SOCKET_SENDTO,
+    MAGIC_SOCKET_CONNECT,
+    MAGIC_SOCKET_ACCEPT,
+} MagicSocket;
 
 typedef struct {
     struct list_head link;
@@ -91,6 +129,28 @@ typedef struct {
     int poll_fd_index; /* temporary use in js_os_poll() */
     JSValue rw_func[2];
 } JSOSRWHandler;
+
+/* one pending async socket operation; polled via poll_fd_index */
+typedef struct {
+    struct list_head link;
+    intptr_t sockfd;
+    MagicSocket magic;
+    int poll_fd_index; /* temporary use in js_os_poll() */
+    int flags; /* MSG_* for recv/send/recvfrom/sendto */
+    uint64_t length;
+    size_t offset;
+    uint8_t *buffer;
+    JSValue bufval;
+    struct sockaddr_storage sockaddr; /* for sendto() */
+    JSValue resolve;
+    JSValue reject;
+} JSOSSockHandler;
+
+/* registry entry: every live socket created by this runtime */
+typedef struct {
+    struct list_head link;
+    intptr_t handle;
+} JSOSockHandle;
 
 typedef struct {
     struct list_head link;
@@ -116,7 +176,9 @@ typedef struct {
 
 typedef struct JSWaker {
 #ifdef _WIN32
-    HANDLE handle;
+    /* loopback socketpair so the waker can be waited on by WSAPoll */
+    SOCKET read_sock;
+    SOCKET write_sock;
 #else
     int read_fd;
     int write_fd;
@@ -145,8 +207,46 @@ typedef struct {
     JSValue reason;
 } JSRejectedPromiseEntry;
 
+/* one async DNS request. The resolver thread only touches the C fields
+   (node/service/hints/sockaddr/ai/host/serv/err); resolve/reject are touched
+   only on the main thread when draining the done queue. */
+typedef struct JSResolverRequest {
+    struct list_head link;
+    int type; /* 0 = getaddrinfo, 1 = getnameinfo */
+    char *node;
+    char *service;
+    struct addrinfo hints;
+    struct sockaddr_storage sockaddr;
+    int ni_flags;
+    struct addrinfo *ai; /* getaddrinfo result chain */
+    char *host; /* getnameinfo result */
+    char *serv; /* getnameinfo result */
+    int err;
+    JSValue resolve;
+    JSValue reject;
+} JSResolverRequest;
+
+/* single persistent resolver thread doing blocking DNS off the main loop */
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    struct list_head pending; /* list of JSResolverRequest.link */
+    struct list_head done; /* list of JSResolverRequest.link */
+    JSWaker waker;
+    atomic_int stop;
+    BOOL started;
+    int outstanding; /* submitted-but-not-drained requests; main thread only */
+} JSResolver;
+
+#if defined(_WIN32)
+struct JSStdinState; /* lazy helper thread backing os.read(0) */
+#endif
+
 typedef struct JSThreadState {
     struct list_head os_rw_handlers; /* list of JSOSRWHandler.link */
+    struct list_head os_sock_handlers; /* list of JSOSSockHandler.link */
+    struct list_head os_sock_handles; /* registry of JSOSockHandle.link */
     struct list_head os_signal_handlers; /* list JSOSSignalHandler.link */
     struct list_head os_timers; /* list of JSOSTimer.link */
     struct list_head port_list; /* list of JSWorkerMessageHandler.link */
@@ -158,14 +258,25 @@ typedef struct JSThreadState {
     /* used by Atomics.notify to wake up other JSRuntimes for
        Atomics.waitAsync() */
     JSWaker atomics_async_waker;
-#if !defined(_WIN32)
-    struct pollfd *poll_fds;
+    JSResolver resolver;
+    js_pollfd *poll_fds;
     int poll_fds_size;
-#endif    
+#if defined(_WIN32)
+    struct JSStdinState *stdin_state;
+#endif
 } JSThreadState;
 
 static uint64_t os_pending_signals;
 static int (*os_poll_func)(JSContext *ctx);
+
+/* drain completed async DNS requests on the main thread (defined later) */
+static void js_resolver_drain(JSContext *ctx);
+#if defined(_WIN32)
+/* stdin is not a socket: a helper thread backs os.read(0) (defined later) */
+static int js_stdin_start(JSThreadState *ts);
+static ssize_t js_stdin_read(JSThreadState *ts, uint8_t *buf, size_t len);
+static void js_stdin_stop(JSThreadState *ts);
+#endif
 
 static void js_std_dbuf_init(JSContext *ctx, DynBuf *s)
 {
@@ -175,6 +286,118 @@ static void js_std_dbuf_init(JSContext *ctx, DynBuf *s)
 static BOOL my_isdigit(int c)
 {
     return (c >= '0' && c <= '9');
+}
+
+/* Convert a JS {family?, addr, port} object to a sockaddr_storage. When
+   .family is omitted it is taken from getsockname(sockfd), defaulting to
+   AF_INET. Returns 0 on success, -1 on error (a JS exception is pending). */
+static int JS_ToSockaddrStruct(JSContext *ctx, JSValue addr,
+    struct sockaddr_storage *sockaddr, intptr_t sockfd)
+{
+    JSValue val;
+    const char *addr_str;
+    uint32_t port, family;
+    int ret;
+
+    /* zero the whole storage so padding/flowinfo/scope_id are not garbage */
+    memset(sockaddr, 0, sizeof(*sockaddr));
+    val = JS_GetPropertyStr(ctx, addr, "family");
+    if (JS_IsException(val))
+        return -1;
+    if (JS_IsUndefined(val)) {
+        struct sockaddr_storage saddr;
+        socklen_t len = sizeof(saddr);
+        if (getsockname(JS_SOCK(sockfd), (struct sockaddr *)&saddr, &len) == 0) {
+            family = saddr.ss_family;
+        } else {
+            family = AF_INET;
+        }
+        JS_FreeValue(ctx, val);
+    } else {
+        ret = JS_ToUint32(ctx, &family, val);
+        JS_FreeValue(ctx, val);
+        if (ret)
+            return -1;
+    }
+    if (family != AF_INET && family != AF_INET6) {
+        JS_ThrowTypeError(ctx, "invalid sockaddr family");
+        return -1;
+    }
+    sockaddr->ss_family = family;
+
+    val = JS_GetPropertyStr(ctx, addr, "addr");
+    if (JS_IsException(val))
+        return -1;
+    addr_str = JS_ToCString(ctx, val);
+    JS_FreeValue(ctx, val);
+    if (!addr_str)
+        return -1;
+    void *sin_addr = family == AF_INET ?
+        (void *)&((struct sockaddr_in *)sockaddr)->sin_addr :
+        (void *)&((struct sockaddr_in6 *)sockaddr)->sin6_addr;
+    ret = inet_pton(sockaddr->ss_family, addr_str, sin_addr);
+    JS_FreeCString(ctx, addr_str);
+    if (ret != 1) {
+        JS_ThrowTypeError(ctx, "invalid sockaddr addr");
+        return -1;
+    }
+
+    val = JS_GetPropertyStr(ctx, addr, "port");
+    ret = JS_ToUint32(ctx, &port, val);
+    JS_FreeValue(ctx, val);
+    if (ret)
+        return -1;
+    if (port > 65535) {
+        JS_ThrowRangeError(ctx, "invalid sockaddr port");
+        return -1;
+    }
+    if (family == AF_INET)
+        ((struct sockaddr_in *)sockaddr)->sin_port = htons(port);
+    else
+        ((struct sockaddr_in6 *)sockaddr)->sin6_port = htons(port);
+
+    return 0;
+}
+
+/* Build a JS {family, port, addr} object from a sockaddr_storage. */
+static JSValue JS_ToSockaddrObj(JSContext *ctx, struct sockaddr_storage *sockaddr)
+{
+    JSValue obj, prop;
+    char ip_str[INET6_ADDRSTRLEN];
+    const char *ip_ptr;
+    struct sockaddr_in *sockaddr4 = (struct sockaddr_in *)sockaddr;
+    struct sockaddr_in6 *sockaddr6 = (struct sockaddr_in6 *)sockaddr;
+
+    obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+
+    prop = JS_NewUint32(ctx, sockaddr->ss_family);
+    JS_DefinePropertyValueStr(ctx, obj, "family", prop, JS_PROP_C_W_E);
+
+    uint16_t sin_port = sockaddr->ss_family == AF_INET ? sockaddr4->sin_port :
+                        sockaddr->ss_family == AF_INET6 ? sockaddr6->sin6_port : 0;
+    prop = JS_NewUint32(ctx, ntohs(sin_port));
+    JS_DefinePropertyValueStr(ctx, obj, "port", prop, JS_PROP_C_W_E);
+
+    void *sin_addr = sockaddr->ss_family == AF_INET ? (void *)&sockaddr4->sin_addr :
+                     sockaddr->ss_family == AF_INET6 ? (void *)&sockaddr6->sin6_addr : NULL;
+    socklen_t sin_len = sockaddr->ss_family == AF_INET ? INET_ADDRSTRLEN :
+                        sockaddr->ss_family == AF_INET6 ? INET6_ADDRSTRLEN : 0;
+    ip_ptr = inet_ntop(sockaddr->ss_family, sin_addr, ip_str, sin_len);
+    prop = ip_ptr ? JS_NewString(ctx, ip_ptr) : JS_NULL;
+    JS_DefinePropertyValueStr(ctx, obj, "addr", prop, JS_PROP_C_W_E);
+    return obj;
+}
+
+/* sockaddr length for the family stored in a sockaddr_storage */
+static socklen_t js_sockaddr_len(const struct sockaddr_storage *ss)
+{
+    if (ss->ss_family == AF_INET)
+        return sizeof(struct sockaddr_in);
+    if (ss->ss_family == AF_INET6)
+        return sizeof(struct sockaddr_in6);
+    return 0;
 }
 
 /* XXX: use 'o' and 'O' for object using JS_PrintValue() ? */
@@ -989,6 +1212,19 @@ static ssize_t js_get_errno(ssize_t ret)
     return ret;
 }
 
+/* socket errors: Winsock reports via WSAGetLastError(), not errno */
+static ssize_t js_get_sockerrno(ssize_t ret)
+{
+#if defined(_WIN32)
+    if (ret == -1 || ret == (ssize_t)INVALID_SOCKET)
+        ret = -WSAGetLastError();
+#else
+    if (ret == -1)
+        ret = -errno;
+#endif
+    return ret;
+}
+
 static JSValue js_std_strerror(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
@@ -1700,6 +1936,34 @@ static const JSCFunctionListEntry js_std_error_props[] = {
     DEF(EPERM),
     DEF(EPIPE),
     DEF(EBADF),
+    DEF(ECANCELED),
+#if defined(_WIN32)
+    /* the socket API reports Winsock errors; expose the BSD-style names used
+       by non-blocking sockets with their Winsock values, plus WSAE* aliases */
+    JS_PROP_INT32_DEF("EAGAIN", WSAEWOULDBLOCK, JS_PROP_CONFIGURABLE),
+    JS_PROP_INT32_DEF("EWOULDBLOCK", WSAEWOULDBLOCK, JS_PROP_CONFIGURABLE),
+    JS_PROP_INT32_DEF("EINPROGRESS", WSAEINPROGRESS, JS_PROP_CONFIGURABLE),
+    DEF(WSAEWOULDBLOCK),
+    DEF(WSAEINPROGRESS),
+    DEF(WSAECONNREFUSED),
+    DEF(WSAECONNRESET),
+    DEF(WSAETIMEDOUT),
+    DEF(WSAEADDRINUSE),
+    DEF(WSAEADDRNOTAVAIL),
+    DEF(WSAENOTCONN),
+    DEF(WSAENOTSOCK),
+    DEF(WSAEINVAL),
+    DEF(WSAEFAULT),
+    DEF(WSAENETUNREACH),
+    DEF(WSAEHOSTUNREACH),
+    DEF(WSAEOPNOTSUPP),
+    DEF(WSAESHUTDOWN),
+    DEF(WSAEMSGSIZE),
+#else
+    DEF(EAGAIN),
+    DEF(EWOULDBLOCK),
+    DEF(EINPROGRESS),
+#endif
 #undef DEF
 };
 
@@ -1825,10 +2089,21 @@ static JSValue js_os_open(JSContext *ctx, JSValueConst this_val,
 static JSValue js_os_close(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
-    int fd, ret;
-    if (JS_ToInt32(ctx, &fd, argv[0]))
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    int64_t handle;
+    int ret;
+    if (JS_ToInt64(ctx, &handle, argv[0]))
         return JS_EXCEPTION;
-    ret = js_get_errno(close(fd));
+    if (js_os_sock_lookup(ts, (intptr_t)handle)) {
+        /* a socket owned by this runtime: cancel pending operations, close
+           the OS handle and drop the registry entry */
+        js_os_sock_cancel(ctx, (intptr_t)handle);
+        js_sock_close((intptr_t)handle);
+        js_os_sock_unregister(rt, (intptr_t)handle);
+        return JS_NewInt32(ctx, 0);
+    }
+    ret = js_get_errno(close((int)handle));
     return JS_NewInt32(ctx, ret);
 }
 
@@ -1875,10 +2150,17 @@ static JSValue js_os_read_write(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (pos + len > size)
         return JS_ThrowRangeError(ctx, "read/write array buffer overflow");
-    if (magic)
+    if (magic) {
         ret = js_get_errno(write(fd, buf + pos, len));
-    else
-        ret = js_get_errno(read(fd, buf + pos, len));
+    } else {
+#if defined(_WIN32)
+        JSThreadState *ts = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+        if (fd == 0 && ts->stdin_state)
+            ret = js_stdin_read(ts, buf + pos, (size_t)len);
+        else
+#endif
+            ret = js_get_errno(read(fd, buf + pos, len));
+    }
     return JS_NewInt64(ctx, ret);
 }
 
@@ -2071,6 +2353,86 @@ static void free_rw_handler(JSRuntime *rt, JSOSRWHandler *rh)
     js_free_rt(rt, rh);
 }
 
+/* close an OS socket handle (Winsock SOCKET vs POSIX fd) */
+static void js_sock_close(intptr_t handle)
+{
+#if defined(_WIN32)
+    closesocket(JS_SOCK(handle));
+#else
+    close((int)handle);
+#endif
+}
+
+/* registry of live sockets owned by this runtime; membership is the
+   authoritative test distinguishing a socket from a CRT fd in os.close() */
+static int js_os_sock_register(JSRuntime *rt, intptr_t handle)
+{
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    JSOSockHandle *h = js_mallocz_rt(rt, sizeof(*h));
+    if (!h)
+        return -1;
+    h->handle = handle;
+    list_add_tail(&h->link, &ts->os_sock_handles);
+    return 0;
+}
+
+static JSOSockHandle *js_os_sock_lookup(JSThreadState *ts, intptr_t handle)
+{
+    struct list_head *el;
+    list_for_each(el, &ts->os_sock_handles) {
+        JSOSockHandle *h = list_entry(el, JSOSockHandle, link);
+        if (h->handle == handle)
+            return h;
+    }
+    return NULL;
+}
+
+/* remove the registry entry (does not close the handle) */
+static void js_os_sock_unregister(JSRuntime *rt, intptr_t handle)
+{
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    JSOSockHandle *h = js_os_sock_lookup(ts, handle);
+    if (h) {
+        list_del(&h->link);
+        js_free_rt(rt, h);
+    }
+}
+
+/* unlink and free a pending operation; does not close the socket */
+static void free_sock_handler(JSRuntime *rt, JSOSSockHandler *sh)
+{
+    list_del(&sh->link);
+    JS_FreeValueRT(rt, sh->bufval);
+    JS_FreeValueRT(rt, sh->resolve);
+    JS_FreeValueRT(rt, sh->reject);
+    js_free_rt(rt, sh);
+}
+
+/* reject and remove all pending async operations on sockfd */
+static void js_os_sock_cancel(JSContext *ctx, intptr_t sockfd)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    struct list_head *el, *el1;
+
+    list_for_each_safe(el, el1, &ts->os_sock_handlers) {
+        JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
+        JSValue errval, func, retval;
+        if (sh->sockfd != sockfd)
+            continue;
+        errval = JS_NewInt32(ctx, -ECANCELED);
+        func = JS_DupValue(ctx, sh->reject);
+        retval = JS_Call(ctx, func, JS_UNDEFINED, 1, &errval);
+        JS_FreeValue(ctx, func);
+        JS_FreeValue(ctx, errval);
+        if (JS_IsException(retval))
+            js_std_dump_error(ctx);
+        else
+            JS_FreeValue(ctx, retval);
+        free_sock_handler(rt, sh);
+    }
+}
+
 static JSValue js_os_setReadHandler(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv, int magic)
 {
@@ -2109,6 +2471,15 @@ static JSValue js_os_setReadHandler(JSContext *ctx, JSValueConst this_val,
         }
         JS_FreeValue(ctx, rh->rw_func[magic]);
         rh->rw_func[magic] = JS_DupValue(ctx, func);
+#if defined(_WIN32)
+        /* stdin is not a socket: start the helper thread so WSAPoll can wait
+           on its waker and os.read(0) can drain the buffered input */
+        if (fd == 0 && magic == 0 && js_stdin_start(ts)) {
+            JS_FreeValue(ctx, rh->rw_func[magic]);
+            rh->rw_func[magic] = JS_NULL;
+            return JS_ThrowInternalError(ctx, "unable to start stdin reader");
+        }
+#endif
     }
     return JS_UNDEFINED;
 }
@@ -2339,26 +2710,89 @@ static void call_handler(JSContext *ctx, JSValueConst func)
 
 #ifdef _WIN32
 
+/* Win has no socketpair(): emulate it with a connected non-blocking loopback
+   TCP pair. Used by wakers (so they can be waited on by WSAPoll) and by
+   os.socketpair(). Returns 0 on success, -1 on error. */
+static int js_win_loopback_pair(SOCKET pair[2])
+{
+    SOCKET lst = INVALID_SOCKET, a = INVALID_SOCKET, b = INVALID_SOCKET;
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    u_long mode = 1;
+
+    pair[0] = pair[1] = INVALID_SOCKET;
+    lst = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (lst == INVALID_SOCKET)
+        goto fail;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(lst, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+        goto fail;
+    if (getsockname(lst, (struct sockaddr *)&addr, &addrlen) == SOCKET_ERROR)
+        goto fail;
+    if (listen(lst, 1) == SOCKET_ERROR)
+        goto fail;
+    a = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (a == INVALID_SOCKET)
+        goto fail;
+    if (connect(a, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+        goto fail;
+    b = accept(lst, NULL, NULL);
+    if (b == INVALID_SOCKET)
+        goto fail;
+    closesocket(lst);
+    lst = INVALID_SOCKET;
+    if (ioctlsocket(a, FIONBIO, &mode) == SOCKET_ERROR)
+        goto fail;
+    if (ioctlsocket(b, FIONBIO, &mode) == SOCKET_ERROR)
+        goto fail;
+    pair[0] = a;
+    pair[1] = b;
+    return 0;
+fail:
+    if (lst != INVALID_SOCKET)
+        closesocket(lst);
+    if (a != INVALID_SOCKET)
+        closesocket(a);
+    if (b != INVALID_SOCKET)
+        closesocket(b);
+    return -1;
+}
+
 static int js_waker_init(JSWaker *w)
 {
-    w->handle = CreateEvent(NULL, TRUE, FALSE, NULL);
-    return w->handle ? 0 : -1;
+    SOCKET pair[2];
+    if (js_win_loopback_pair(pair))
+        return -1;
+    w->read_sock = pair[0];
+    w->write_sock = pair[1];
+    return 0;
 }
 
 static void js_waker_signal(JSWaker *w)
 {
-    SetEvent(w->handle);
+    /* one byte makes read_sock readable; if the buffer is full a poll
+       wakeup is already pending, so WSAEWOULDBLOCK can be ignored */
+    send(w->write_sock, "", 1, 0);
 }
 
 static void js_waker_clear(JSWaker *w)
 {
-    ResetEvent(w->handle);
+    char buf[64];
+    while (recv(w->read_sock, buf, sizeof(buf), 0) > 0)
+        continue;
 }
 
 static void js_waker_close(JSWaker *w)
 {
-    CloseHandle(w->handle);
-    w->handle = INVALID_HANDLE_VALUE;
+    if (w->read_sock != INVALID_SOCKET)
+        closesocket(w->read_sock);
+    if (w->write_sock != INVALID_SOCKET)
+        closesocket(w->write_sock);
+    w->read_sock = INVALID_SOCKET;
+    w->write_sock = INVALID_SOCKET;
 }
 
 #else // !_WIN32
@@ -2482,27 +2916,341 @@ static int handle_posted_message(JSRuntime *rt, JSContext *ctx,
 }
 #endif /* !USE_WORKER */
 
+/* Dispatch one ready pending socket operation. js_os_poll() calls this when
+   the operation's pollfd reports revents != 0. Shared by POSIX poll() and
+   Win WSAPoll(); the readiness mask is chosen by magic in js_os_poll(). */
+static void handle_socket_message(JSContext *ctx, JSOSSockHandler *sh)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    intptr_t err = 0;
+    intptr_t newfd = -1;
+    struct sockaddr_storage sockaddr;
+    socklen_t addr_len = sizeof(sockaddr);
+
+    memset(&sockaddr, 0, sizeof(sockaddr));
+
+    /* re-validate the user buffer: it may have been detached or resized
+       while the operation was pending */
+    if (sh->magic != MAGIC_SOCKET_CONNECT && sh->magic != MAGIC_SOCKET_ACCEPT) {
+        size_t buflen;
+        uint8_t *buf = JS_GetArrayBuffer(ctx, &buflen, sh->bufval);
+        if (!buf) {
+            JS_FreeValue(ctx, JS_GetException(ctx)); /* clear detached TypeError */
+            err = -EINVAL;
+            goto done;
+        }
+        sh->buffer = buf;
+        if (sh->offset > buflen)
+            sh->offset = buflen;
+        if (sh->length > buflen - sh->offset)
+            sh->length = buflen - sh->offset;
+    }
+
+    if (sh->magic == MAGIC_SOCKET_RECV) {
+        err = js_get_sockerrno(recv(JS_SOCK(sh->sockfd), (char *)sh->buffer + sh->offset,
+                                    JS_SOCK_LEN(sh->length), sh->flags));
+    } else if (sh->magic == MAGIC_SOCKET_SEND) {
+        err = js_get_sockerrno(send(JS_SOCK(sh->sockfd), (char *)sh->buffer + sh->offset,
+                                    JS_SOCK_LEN(sh->length), sh->flags));
+    } else if (sh->magic == MAGIC_SOCKET_RECVFROM) {
+        err = js_get_sockerrno(recvfrom(JS_SOCK(sh->sockfd), (char *)sh->buffer + sh->offset,
+                                        JS_SOCK_LEN(sh->length), sh->flags,
+                                        (struct sockaddr *)&sockaddr, &addr_len));
+    } else if (sh->magic == MAGIC_SOCKET_SENDTO) {
+        addr_len = js_sockaddr_len(&sh->sockaddr);
+        err = js_get_sockerrno(sendto(JS_SOCK(sh->sockfd), (char *)sh->buffer + sh->offset,
+                                      JS_SOCK_LEN(sh->length), sh->flags,
+                                      (const struct sockaddr *)&sh->sockaddr, addr_len));
+    } else if (sh->magic == MAGIC_SOCKET_CONNECT) {
+        /* completion (success or failure) is reported by SO_ERROR on both
+           platforms once the socket becomes writable */
+        int soerr = 0;
+        socklen_t len = sizeof(soerr);
+        if (getsockopt(JS_SOCK(sh->sockfd), SOL_SOCKET, SO_ERROR, (char *)&soerr, &len) < 0)
+            err = js_get_sockerrno(-1);
+        else
+            err = soerr ? -soerr : 0;
+    } else if (sh->magic == MAGIC_SOCKET_ACCEPT) {
+        newfd = accept(JS_SOCK(sh->sockfd), (struct sockaddr *)&sockaddr, &addr_len);
+        err = js_get_sockerrno(newfd);
+        if (err >= 0) {
+            /* the accepted socket must be non-blocking for later async ops */
+#if defined(_WIN32)
+            u_long mode = 1;
+            if (ioctlsocket(JS_SOCK(newfd), FIONBIO, &mode) == SOCKET_ERROR) {
+                err = -WSAGetLastError();
+                closesocket(JS_SOCK(newfd));
+                goto done;
+            }
+#else
+            int flags = fcntl((int)newfd, F_GETFL, 0);
+            if (flags < 0 || fcntl((int)newfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                err = -errno;
+                close((int)newfd);
+                goto done;
+            }
+#endif
+            if (js_os_sock_register(rt, newfd) < 0) {
+                err = -ENOMEM;
+                js_sock_close(newfd);
+                goto done;
+            }
+        }
+    }
+
+    /* spurious readiness: keep the operation pending for the next poll */
+#if defined(_WIN32)
+    if (err == -WSAEWOULDBLOCK)
+        return;
+#else
+    if (err == -EAGAIN || err == -EWOULDBLOCK)
+        return;
+#endif
+
+done:
+    {
+        JSValue promiseval, func, retval;
+        if (err < 0) {
+            promiseval = JS_NewInt32(ctx, (int)err);
+        } else if (sh->magic == MAGIC_SOCKET_ACCEPT || sh->magic == MAGIC_SOCKET_RECVFROM) {
+            JSValue addrObj = JS_ToSockaddrObj(ctx, &sockaddr);
+            promiseval = JS_NewArray(ctx);
+            if (JS_IsException(promiseval) || JS_IsException(addrObj)) {
+                JS_FreeValue(ctx, promiseval);
+                JS_FreeValue(ctx, addrObj);
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                promiseval = JS_NewInt32(ctx, -ENOMEM);
+                err = -ENOMEM;
+            } else {
+                /* accept: err is the new handle; recvfrom: err is the count */
+                JS_DefinePropertyValueUint32(ctx, promiseval, 0, JS_NewInt64(ctx, err), JS_PROP_C_W_E);
+                JS_DefinePropertyValueUint32(ctx, promiseval, 1, addrObj, JS_PROP_C_W_E);
+            }
+        } else {
+            promiseval = JS_NewInt64(ctx, err);
+        }
+        /* 'func' might be destroyed when calling itself (if it frees the
+           handler), so must take extra care */
+        func = JS_DupValue(ctx, err < 0 ? sh->reject : sh->resolve);
+        retval = JS_Call(ctx, func, JS_UNDEFINED, 1, &promiseval);
+        JS_FreeValue(ctx, func);
+        if (JS_IsException(retval))
+            js_std_dump_error(ctx);
+        else
+            JS_FreeValue(ctx, retval);
+        JS_FreeValue(ctx, promiseval);
+        free_sock_handler(rt, sh);
+    }
+}
+
+/* unified dynamic pollfd array helpers shared by POSIX poll / Win WSAPoll */
+static no_inline int js_poll_expand(JSThreadState *ts)
+{
+    js_pollfd *new_fds;
+    int new_size = max_int(ts->poll_fds_size +
+                           ts->poll_fds_size / 2, 16);
+    new_fds = realloc(ts->poll_fds, new_size * sizeof(js_pollfd));
+    if (!new_fds)
+        return -1;
+    ts->poll_fds = new_fds;
+    ts->poll_fds_size = new_size;
+    return 0;
+}
+
+static int js_poll_add_poll_fd(JSThreadState *ts, int *pnfds, intptr_t fd, int events)
+{
+    js_pollfd *fds;
+    int nfds = *pnfds;
+    if (unlikely(nfds >= ts->poll_fds_size)) {
+        if (js_poll_expand(ts))
+            return -1;
+    }
+    fds = &ts->poll_fds[nfds++];
+    fds->fd = JS_SOCK(fd);
+    fds->events = events;
+    fds->revents = 0;
+    *pnfds = nfds;
+    return 0;
+}
+
+/* readiness mask for a pending socket operation; CONNECT watches both
+   directions and resolves via SO_ERROR, errors arrive as POLLERR/HUP */
+static int js_sock_poll_events(MagicSocket magic)
+{
+    switch (magic) {
+    case MAGIC_SOCKET_SEND:
+    case MAGIC_SOCKET_SENDTO:
+        return POLLOUT;
+    case MAGIC_SOCKET_CONNECT:
+        return POLLIN | POLLOUT;
+    default: /* RECV / RECVFROM / ACCEPT */
+        return POLLIN;
+    }
+}
+
+#if defined(_WIN32)
+/* stdin cannot be waited on by WSAPoll. A helper thread does blocking
+   ReadFile into a mutex-protected buffer and signals a waker; the main loop
+   waits on that waker and os.read(0) drains the buffer. */
+typedef struct JSStdinState {
+    HANDLE thread;
+    HANDLE hStdin;
+    BOOL is_console;
+    CRITICAL_SECTION mutex;
+    uint8_t *buf;
+    size_t buf_len;
+    size_t buf_cap;
+    BOOL eof;
+    volatile LONG stop;
+    JSWaker waker;
+} JSStdinState;
+
+static DWORD WINAPI js_stdin_thread(LPVOID arg)
+{
+    JSStdinState *s = arg;
+    uint8_t tmp[4096];
+    while (!InterlockedCompareExchange(&s->stop, 0, 0)) {
+        DWORD n = 0;
+        /* a console input handle is waitable: poll with a timeout so stop is
+           honored promptly without relying on I/O cancellation */
+        if (s->is_console &&
+            WaitForSingleObject(s->hStdin, 50) == WAIT_TIMEOUT)
+            continue;
+        if (!ReadFile(s->hStdin, tmp, sizeof(tmp), &n, NULL) || n == 0) {
+            EnterCriticalSection(&s->mutex);
+            s->eof = TRUE;
+            LeaveCriticalSection(&s->mutex);
+            js_waker_signal(&s->waker);
+            break;
+        }
+        EnterCriticalSection(&s->mutex);
+        if (s->buf_len + n > s->buf_cap) {
+            size_t new_cap = s->buf_cap ? s->buf_cap * 2 : 4096;
+            uint8_t *new_buf;
+            if (new_cap < s->buf_len + n)
+                new_cap = s->buf_len + n;
+            new_buf = realloc(s->buf, new_cap);
+            if (new_buf) {
+                s->buf = new_buf;
+                s->buf_cap = new_cap;
+            }
+        }
+        if (s->buf_len + n <= s->buf_cap) {
+            memcpy(s->buf + s->buf_len, tmp, n);
+            s->buf_len += n;
+        }
+        LeaveCriticalSection(&s->mutex);
+        js_waker_signal(&s->waker);
+    }
+    return 0;
+}
+
+static int js_stdin_start(JSThreadState *ts)
+{
+    JSStdinState *s;
+    if (ts->stdin_state)
+        return 0;
+    s = malloc(sizeof(*s));
+    if (!s)
+        return -1;
+    memset(s, 0, sizeof(*s));
+    s->hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    s->is_console = (GetFileType(s->hStdin) == FILE_TYPE_CHAR);
+    InitializeCriticalSection(&s->mutex);
+    if (js_waker_init(&s->waker))
+        goto fail;
+    s->thread = CreateThread(NULL, 0, js_stdin_thread, s, 0, NULL);
+    if (!s->thread)
+        goto fail_waker;
+    ts->stdin_state = s;
+    return 0;
+fail_waker:
+    js_waker_close(&s->waker);
+fail:
+    DeleteCriticalSection(&s->mutex);
+    free(s);
+    return -1;
+}
+
+static ssize_t js_stdin_read(JSThreadState *ts, uint8_t *buf, size_t len)
+{
+    JSStdinState *s = ts->stdin_state;
+    size_t n;
+    BOOL eof;
+    if (!s)
+        return -JS_EAGAIN;
+    EnterCriticalSection(&s->mutex);
+    n = len < s->buf_len ? len : s->buf_len;
+    if (n > 0) {
+        memcpy(buf, s->buf, n);
+        memmove(s->buf, s->buf + n, s->buf_len - n);
+        s->buf_len -= n;
+    }
+    eof = s->eof;
+    LeaveCriticalSection(&s->mutex);
+    if (n > 0)
+        return (ssize_t)n;
+    return eof ? 0 : -JS_EAGAIN;
+}
+
+static void js_stdin_stop(JSThreadState *ts)
+{
+    JSStdinState *s = ts->stdin_state;
+    if (!s)
+        return;
+    ts->stdin_state = NULL;
+    InterlockedExchange(&s->stop, 1);
+    /* the console ReadFile is synchronous: CancelSynchronousIo targets the
+       thread; CancelIoEx covers redirected pipe/disk handles */
+    CancelSynchronousIo(s->thread);
+    CancelIoEx(s->hStdin, NULL);
+    if (WaitForSingleObject(s->thread, 250) == WAIT_OBJECT_0) {
+        CloseHandle(s->thread);
+        js_waker_close(&s->waker);
+        DeleteCriticalSection(&s->mutex);
+        free(s->buf);
+        free(s);
+    } else {
+        /* a console line-input ReadFile may ignore cancellation mid-line:
+           orphan the state (keep it allocated) so the still-running thread
+           never touches freed memory; it exits on input or at process end */
+        CloseHandle(s->thread);
+    }
+}
+#endif /* _WIN32 */
+
 #if defined(_WIN32)
 
 static int js_os_poll(JSContext *ctx)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
-    int min_delay, count;
+    int min_delay, nfds, atomics_fd_index, resolver_fd_index, stdin_fd_index;
     int64_t cur_time, delay;
-    JSOSRWHandler *rh;
     struct list_head *el;
-    HANDLE handles[MAXIMUM_WAIT_OBJECTS]; // 64
 
-    /* XXX: handle signals if useful */
+    /* dispatch pending signals in the main thread */
+    if (!ts->recv_pipe && unlikely(os_pending_signals != 0)) {
+        JSOSSignalHandler *sh;
+        uint64_t mask;
+        list_for_each(el, &ts->os_signal_handlers) {
+            sh = list_entry(el, JSOSSignalHandler, link);
+            mask = (uint64_t)1 << sh->sig_num;
+            if (os_pending_signals & mask) {
+                os_pending_signals &= ~mask;
+                call_handler(ctx, sh->func);
+                return 0;
+            }
+        }
+    }
 
     delay = JS_AtomicsPollWaiters(ctx);
 
-    if (list_empty(&ts->os_rw_handlers) && list_empty(&ts->os_timers) &&
-        list_empty(&ts->port_list) && delay < 0) {
+    if (list_empty(&ts->os_rw_handlers) && list_empty(&ts->os_sock_handlers) &&
+        list_empty(&ts->os_timers) && list_empty(&ts->port_list) &&
+        ts->resolver.outstanding == 0 && delay < 0)
         return -1; /* no more events */
-    }
-    
+
     min_delay = 10000;
     if (delay >= 0 && delay < min_delay)
         min_delay = delay;
@@ -2513,9 +3261,7 @@ static int js_os_poll(JSContext *ctx)
             JSOSTimer *th = list_entry(el, JSOSTimer, link);
             delay = th->timeout - cur_time;
             if (delay <= 0) {
-                JSValue func;
-                /* the timer expired */
-                func = th->func;
+                JSValue func = th->func;
                 th->func = JS_UNDEFINED;
                 free_timer(rt, th);
                 call_handler(ctx, func);
@@ -2527,62 +3273,87 @@ static int js_os_poll(JSContext *ctx)
         }
     }
 
-    count = 0;
-    list_for_each(el, &ts->os_rw_handlers) {
-        rh = list_entry(el, JSOSRWHandler, link);
-        if (rh->fd == 0 && !JS_IsNull(rh->rw_func[0])) {
-            if (count == (int)countof(handles))
-                break;
-            handles[count++] = (HANDLE)_get_osfhandle(rh->fd); // stdin
-        }
+    nfds = 0;
+    list_for_each(el, &ts->os_sock_handlers) {
+        JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
+        sh->poll_fd_index = nfds;
+        if (js_poll_add_poll_fd(ts, &nfds, sh->sockfd, js_sock_poll_events(sh->magic)))
+            return -1;
     }
 
     list_for_each(el, &ts->port_list) {
         JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
-        if (JS_IsNull(port->on_message_func))
-            continue;
-        if (count == (int)countof(handles))
-            break;
-        handles[count++] = port->recv_pipe->waker.handle;
+        if (!JS_IsNull(port->on_message_func)) {
+            port->poll_fd_index = nfds;
+            if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(port->recv_pipe->waker), POLLIN))
+                return -1;
+        }
     }
 
-    if (count < (int)countof(handles)) {
-        handles[count++] = ts->atomics_async_waker.handle;
+    stdin_fd_index = -1;
+    if (ts->stdin_state) {
+        JSOSRWHandler *rh;
+        list_for_each(el, &ts->os_rw_handlers) {
+            rh = list_entry(el, JSOSRWHandler, link);
+            if (rh->fd == 0 && !JS_IsNull(rh->rw_func[0])) {
+                stdin_fd_index = nfds;
+                if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->stdin_state->waker), POLLIN))
+                    return -1;
+                break;
+            }
+        }
     }
-    
-    if (count > 0) {
-        DWORD ret, timeout = INFINITE;
-        if (min_delay != -1)
-            timeout = min_delay;
-        ret = WaitForMultipleObjects(count, handles, FALSE, timeout);
 
-        if (ret < count) {
+    resolver_fd_index = -1;
+    if (ts->resolver.started) {
+        resolver_fd_index = nfds;
+        if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->resolver.waker), POLLIN))
+            return -1;
+    }
+
+    atomics_fd_index = nfds;
+    if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->atomics_async_waker), POLLIN))
+        return -1;
+
+    nfds = WSAPoll(ts->poll_fds, nfds, min_delay);
+    if (nfds > 0) {
+        list_for_each(el, &ts->os_sock_handlers) {
+            JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
+            if (ts->poll_fds[sh->poll_fd_index].revents != 0) {
+                handle_socket_message(ctx, sh);
+                /* must stop because the list may have been modified */
+                goto done;
+            }
+        }
+
+        list_for_each(el, &ts->port_list) {
+            JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
+            if (!JS_IsNull(port->on_message_func) &&
+                ts->poll_fds[port->poll_fd_index].revents != 0) {
+                if (handle_posted_message(rt, ctx, port))
+                    goto done;
+            }
+        }
+
+        if (stdin_fd_index >= 0 && ts->poll_fds[stdin_fd_index].revents != 0) {
+            JSOSRWHandler *rh;
             list_for_each(el, &ts->os_rw_handlers) {
                 rh = list_entry(el, JSOSRWHandler, link);
                 if (rh->fd == 0 && !JS_IsNull(rh->rw_func[0])) {
                     call_handler(ctx, rh->rw_func[0]);
-                    /* must stop because the list may have been modified */
                     goto done;
                 }
             }
-
-            list_for_each(el, &ts->port_list) {
-                JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
-                if (!JS_IsNull(port->on_message_func)) {
-                    JSWorkerMessagePipe *ps = port->recv_pipe;
-                    if (ps->waker.handle == handles[ret]) {
-                        if (handle_posted_message(rt, ctx, port))
-                            goto done;
-                    }
-                }
-            }
-
-            if (ts->atomics_async_waker.handle == handles[ret]) {
-                js_waker_clear(&ts->atomics_async_waker);
-            }
         }
-    } else {
-        Sleep(min_delay);
+
+        if (resolver_fd_index >= 0 && ts->poll_fds[resolver_fd_index].revents != 0) {
+            js_waker_clear(&ts->resolver.waker);
+            js_resolver_drain(ctx);
+            goto done;
+        }
+
+        if (ts->poll_fds[atomics_fd_index].revents != 0)
+            js_waker_clear(&ts->atomics_async_waker);
     }
  done:
     return 0;
@@ -2590,41 +3361,11 @@ static int js_os_poll(JSContext *ctx)
 
 #else
 
-static no_inline int js_poll_expand(JSThreadState *ts)
-{
-    struct pollfd *new_fds;
-    int new_size = max_int(ts->poll_fds_size +
-                           ts->poll_fds_size / 2, 16);
-    new_fds = realloc(ts->poll_fds, new_size * sizeof(struct pollfd));
-    if (!new_fds)
-        return -1;
-    ts->poll_fds = new_fds;
-    ts->poll_fds_size = new_size;
-    return 0;
-}
-
-static int js_poll_add_poll_fd(JSThreadState *ts, int *pnfds, int fd, int events)
-{
-    struct pollfd *fds;
-    int nfds;
-    nfds = *pnfds;
-    if (unlikely(nfds >= ts->poll_fds_size)) {
-        if (js_poll_expand(ts))
-            return -1;
-    }
-    fds = &ts->poll_fds[nfds++];
-    fds->fd = fd;
-    fds->events = events;
-    fds->revents = 0;
-    *pnfds = nfds;
-    return 0;
-}
-
 static int js_os_poll(JSContext *ctx)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
-    int min_delay, nfds, atomics_async_waker_fd_index;
+    int min_delay, nfds, atomics_fd_index, resolver_fd_index;
     int64_t cur_time, delay;
     JSOSRWHandler *rh;
     struct list_head *el;
@@ -2648,14 +3389,15 @@ static int js_os_poll(JSContext *ctx)
 
     delay = JS_AtomicsPollWaiters(ctx);
 
-    if (list_empty(&ts->os_rw_handlers) && list_empty(&ts->os_timers) &&
-        list_empty(&ts->port_list) && delay < 0)
+    if (list_empty(&ts->os_rw_handlers) && list_empty(&ts->os_sock_handlers) &&
+        list_empty(&ts->os_timers) && list_empty(&ts->port_list) &&
+        ts->resolver.outstanding == 0 && delay < 0)
         return -1; /* no more events */
 
     min_delay = 10000;
     if (delay >= 0 && delay < min_delay)
         min_delay = delay;
-    
+
     if (!list_empty(&ts->os_timers)) {
         cur_time = get_time_ms();
         list_for_each(el, &ts->os_timers) {
@@ -2675,7 +3417,7 @@ static int js_os_poll(JSContext *ctx)
             }
         }
     }
-    
+
     nfds = 0;
     list_for_each(el, &ts->os_rw_handlers) {
         int events;
@@ -2693,18 +3435,31 @@ static int js_os_poll(JSContext *ctx)
         }
     }
 
+    list_for_each(el, &ts->os_sock_handlers) {
+        JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
+        sh->poll_fd_index = nfds;
+        if (js_poll_add_poll_fd(ts, &nfds, sh->sockfd, js_sock_poll_events(sh->magic)))
+            return -1;
+    }
+
     list_for_each(el, &ts->port_list) {
         JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
         if (!JS_IsNull(port->on_message_func)) {
-            JSWorkerMessagePipe *ps = port->recv_pipe;
             port->poll_fd_index = nfds;
-            if (js_poll_add_poll_fd(ts, &nfds, ps->waker.read_fd, POLLIN))
+            if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(port->recv_pipe->waker), POLLIN))
                 return -1;
         }
     }
 
-    atomics_async_waker_fd_index = nfds;
-    if (js_poll_add_poll_fd(ts, &nfds, ts->atomics_async_waker.read_fd, POLLIN))
+    resolver_fd_index = -1;
+    if (ts->resolver.started) {
+        resolver_fd_index = nfds;
+        if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->resolver.waker), POLLIN))
+            return -1;
+    }
+
+    atomics_fd_index = nfds;
+    if (js_poll_add_poll_fd(ts, &nfds, JS_WAKER_READ_FD(ts->atomics_async_waker), POLLIN))
         return -1;
 
     nfds = poll(ts->poll_fds, nfds, min_delay);
@@ -2725,6 +3480,15 @@ static int js_os_poll(JSContext *ctx)
             }
         }
 
+        list_for_each(el, &ts->os_sock_handlers) {
+            JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
+            if (ts->poll_fds[sh->poll_fd_index].revents != 0) {
+                handle_socket_message(ctx, sh);
+                /* must stop because the list may have been modified */
+                goto done;
+            }
+        }
+
         list_for_each(el, &ts->port_list) {
             JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
             if (!JS_IsNull(port->on_message_func)) {
@@ -2734,7 +3498,14 @@ static int js_os_poll(JSContext *ctx)
                 }
             }
         }
-        if (ts->poll_fds[atomics_async_waker_fd_index].revents != 0) {
+
+        if (resolver_fd_index >= 0 && ts->poll_fds[resolver_fd_index].revents != 0) {
+            js_waker_clear(&ts->resolver.waker);
+            js_resolver_drain(ctx);
+            goto done;
+        }
+
+        if (ts->poll_fds[atomics_fd_index].revents != 0) {
             js_waker_clear(&ts->atomics_async_waker);
         }
     }
@@ -2742,6 +3513,246 @@ static int js_os_poll(JSContext *ctx)
     return 0;
 }
 #endif /* !_WIN32 */
+
+/* Build a SocketAddrInfo[] JS array from a getaddrinfo result chain.
+   Shared by the synchronous getaddrinfo and the async resolver drain. */
+static JSValue js_build_addrinfo_array(JSContext *ctx, struct addrinfo *ai)
+{
+    JSValue arr = JS_NewArray(ctx);
+    struct addrinfo *it;
+    uint32_t idx = 0;
+    if (JS_IsException(arr))
+        return arr;
+    for (it = ai; it; it = it->ai_next) {
+        JSValue obj = JS_NewObject(ctx);
+        struct sockaddr_storage ss;
+        struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
+        char ip_str[INET6_ADDRSTRLEN];
+        const char *ip_ptr;
+        const void *sin_addr;
+        uint16_t sin_port;
+        socklen_t ip_len;
+        if (JS_IsException(obj)) {
+            JS_FreeValue(ctx, arr);
+            return JS_EXCEPTION;
+        }
+        JS_DefinePropertyValueStr(ctx, obj, "flags", JS_NewInt32(ctx, it->ai_flags), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "family", JS_NewInt32(ctx, it->ai_family), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "socktype", JS_NewInt32(ctx, it->ai_socktype), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "protocol", JS_NewInt32(ctx, it->ai_protocol), JS_PROP_C_W_E);
+        memset(&ss, 0, sizeof(ss));
+        if (it->ai_addr && it->ai_addrlen <= sizeof(ss))
+            memcpy(&ss, it->ai_addr, it->ai_addrlen);
+        /* flatten addr/port so the entry can be passed to bind()/connect() */
+        if (ss.ss_family == AF_INET) {
+            sin_addr = &s4->sin_addr; sin_port = s4->sin_port; ip_len = INET_ADDRSTRLEN;
+        } else if (ss.ss_family == AF_INET6) {
+            sin_addr = &s6->sin6_addr; sin_port = s6->sin6_port; ip_len = INET6_ADDRSTRLEN;
+        } else {
+            sin_addr = NULL; sin_port = 0; ip_len = 0;
+        }
+        ip_ptr = sin_addr ? inet_ntop(ss.ss_family, sin_addr, ip_str, ip_len) : NULL;
+        JS_DefinePropertyValueStr(ctx, obj, "addr",
+            ip_ptr ? JS_NewString(ctx, ip_ptr) : JS_NULL, JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "port", JS_NewUint32(ctx, ntohs(sin_port)), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, obj, "canonname",
+            it->ai_canonname ? JS_NewString(ctx, it->ai_canonname) : JS_NULL, JS_PROP_C_W_E);
+        JS_DefinePropertyValueUint32(ctx, arr, idx++, obj, JS_PROP_C_W_E);
+    }
+    return arr;
+}
+
+/* free a resolver request's C data and JS references */
+static void js_resolver_request_free(JSRuntime *rt, JSResolverRequest *req)
+{
+    if (req->ai)
+        freeaddrinfo(req->ai);
+    free(req->node);
+    free(req->service);
+    free(req->host);
+    free(req->serv);
+    JS_FreeValueRT(rt, req->resolve);
+    JS_FreeValueRT(rt, req->reject);
+    js_free_rt(rt, req);
+}
+
+/* resolver thread: blocking DNS off the main loop. Only C data is touched
+   here; resolve/reject are never accessed from this thread. */
+static void *js_resolver_thread(void *arg)
+{
+    JSResolver *r = arg;
+    for (;;) {
+        JSResolverRequest *req;
+        struct list_head *el;
+
+        pthread_mutex_lock(&r->mutex);
+        while (!atomic_load(&r->stop) && list_empty(&r->pending))
+            pthread_cond_wait(&r->cond, &r->mutex);
+        if (atomic_load(&r->stop)) {
+            pthread_mutex_unlock(&r->mutex);
+            break;
+        }
+        el = r->pending.next;
+        list_del(el);
+        req = list_entry(el, JSResolverRequest, link);
+        pthread_mutex_unlock(&r->mutex);
+
+        if (req->type == 0) {
+            struct addrinfo *ai = NULL;
+            int ret = getaddrinfo(req->node, req->service, &req->hints, &ai);
+            req->ai = ai;
+            req->err = ret ? -ret : 0;
+        } else {
+            char host[NI_MAXHOST], serv[NI_MAXSERV];
+            socklen_t len = js_sockaddr_len(&req->sockaddr);
+            int ret = getnameinfo((struct sockaddr *)&req->sockaddr, len,
+                                  host, sizeof(host), serv, sizeof(serv), req->ni_flags);
+            if (ret == 0) {
+                req->host = strdup(host);
+                req->serv = strdup(serv);
+                req->err = (req->host && req->serv) ? 0 : -ENOMEM;
+            } else {
+                req->err = -ret;
+            }
+        }
+
+        pthread_mutex_lock(&r->mutex);
+        list_add_tail(&req->link, &r->done);
+        pthread_mutex_unlock(&r->mutex);
+        js_waker_signal(&r->waker);
+    }
+    return NULL;
+}
+
+static int js_resolver_start(JSRuntime *rt)
+{
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    JSResolver *r = &ts->resolver;
+    if (r->started)
+        return 0;
+    if (pthread_create(&r->thread, NULL, js_resolver_thread, r))
+        return -1;
+    r->started = TRUE;
+    return 0;
+}
+
+/* hand a fully-populated C request to the resolver and return its promise */
+static JSValue js_resolver_submit(JSContext *ctx, JSResolverRequest *req)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    JSResolver *r = &ts->resolver;
+    JSValue promise, resolving_funcs[2];
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        return JS_EXCEPTION;
+    req->resolve = JS_DupValue(ctx, resolving_funcs[0]);
+    req->reject = JS_DupValue(ctx, resolving_funcs[1]);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+
+    if (js_resolver_start(rt)) {
+        JS_FreeValue(ctx, promise);
+        JS_ThrowInternalError(ctx, "unable to start DNS resolver");
+        return JS_EXCEPTION;
+    }
+    pthread_mutex_lock(&r->mutex);
+    list_add_tail(&req->link, &r->pending);
+    r->outstanding++;
+    pthread_cond_signal(&r->cond);
+    pthread_mutex_unlock(&r->mutex);
+    return promise;
+}
+
+/* main-thread drain of completed requests: build JS results and settle the
+   promises. Called from js_os_poll() when the resolver waker is readable. */
+static void js_resolver_drain(JSContext *ctx)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    JSResolver *r = &ts->resolver;
+
+    for (;;) {
+        JSResolverRequest *req;
+        struct list_head *el;
+        JSValue result, func, retval;
+
+        pthread_mutex_lock(&r->mutex);
+        if (list_empty(&r->done)) {
+            pthread_mutex_unlock(&r->mutex);
+            break;
+        }
+        el = r->done.next;
+        list_del(el);
+        req = list_entry(el, JSResolverRequest, link);
+        pthread_mutex_unlock(&r->mutex);
+
+        if (req->err < 0) {
+            result = JS_NewInt32(ctx, req->err);
+        } else if (req->type == 0) {
+            result = js_build_addrinfo_array(ctx, req->ai);
+            if (JS_IsException(result)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                result = JS_NewInt32(ctx, -ENOMEM);
+                req->err = -ENOMEM;
+            }
+        } else {
+            result = JS_NewObject(ctx);
+            if (JS_IsException(result)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                result = JS_NewInt32(ctx, -ENOMEM);
+                req->err = -ENOMEM;
+            } else {
+                JS_DefinePropertyValueStr(ctx, result, "host",
+                    JS_NewString(ctx, req->host ? req->host : ""), JS_PROP_C_W_E);
+                JS_DefinePropertyValueStr(ctx, result, "service",
+                    JS_NewString(ctx, req->serv ? req->serv : ""), JS_PROP_C_W_E);
+            }
+        }
+        func = JS_DupValue(ctx, req->err < 0 ? req->reject : req->resolve);
+        retval = JS_Call(ctx, func, JS_UNDEFINED, 1, &result);
+        JS_FreeValue(ctx, func);
+        JS_FreeValue(ctx, result);
+        if (JS_IsException(retval))
+            js_std_dump_error(ctx);
+        else
+            JS_FreeValue(ctx, retval);
+        js_resolver_request_free(rt, req);
+        r->outstanding--;
+    }
+}
+
+/* stop the resolver thread and free any leftover requests (free_handlers) */
+static void js_resolver_stop(JSRuntime *rt)
+{
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    JSResolver *r = &ts->resolver;
+    struct list_head *el, *el1;
+
+    if (r->started) {
+        atomic_store(&r->stop, 1);
+        pthread_mutex_lock(&r->mutex);
+        pthread_cond_broadcast(&r->cond);
+        pthread_mutex_unlock(&r->mutex);
+        pthread_join(r->thread, NULL);
+        r->started = FALSE;
+    }
+    list_for_each_safe(el, el1, &r->pending) {
+        JSResolverRequest *req = list_entry(el, JSResolverRequest, link);
+        list_del(el);
+        js_resolver_request_free(rt, req);
+    }
+    list_for_each_safe(el, el1, &r->done) {
+        JSResolverRequest *req = list_entry(el, JSResolverRequest, link);
+        list_del(el);
+        js_resolver_request_free(rt, req);
+    }
+    js_waker_close(&r->waker);
+    pthread_mutex_destroy(&r->mutex);
+    pthread_cond_destroy(&r->cond);
+}
 
 static JSValue make_obj_error(JSContext *ctx,
                               JSValue obj,
@@ -4008,6 +5019,638 @@ void js_std_set_worker_new_context_func(JSContext *(*func)(JSRuntime *rt))
 #define OS_PLATFORM "linux"
 #endif
 
+/* ---- socket API ---- */
+
+static JSValue js_os_socket(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    int domain, type, protocol = 0;
+    intptr_t sockfd;
+    ssize_t err;
+
+    if (JS_ToInt32(ctx, &domain, argv[0]))
+        return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &type, argv[1]))
+        return JS_EXCEPTION;
+    if (argc > 2 && JS_ToInt32(ctx, &protocol, argv[2]))
+        return JS_EXCEPTION;
+    sockfd = socket(domain, type, protocol);
+    err = js_get_sockerrno(sockfd);
+    if (err < 0)
+        return JS_NewInt64(ctx, err);
+    /* sockets are non-blocking so async operations never stall the loop */
+#if defined(_WIN32)
+    {
+        u_long mode = 1;
+        if (ioctlsocket(JS_SOCK(sockfd), FIONBIO, &mode) == SOCKET_ERROR) {
+            err = -WSAGetLastError();
+            closesocket(JS_SOCK(sockfd));
+            return JS_NewInt64(ctx, err);
+        }
+    }
+#else
+    {
+        int flags = fcntl((int)sockfd, F_GETFL, 0);
+        if (flags < 0 || fcntl((int)sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            err = -errno;
+            close((int)sockfd);
+            return JS_NewInt64(ctx, err);
+        }
+    }
+#endif
+    if (js_os_sock_register(rt, sockfd) < 0) {
+        js_sock_close(sockfd);
+        return JS_NewInt64(ctx, -ENOMEM);
+    }
+    return JS_NewInt64(ctx, sockfd);
+}
+
+static JSValue js_os_get_setsockopt(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv, int magic)
+{
+    int optname, level = SOL_SOCKET;
+    int64_t sockfd;
+    ssize_t err;
+    size_t size;
+    uint8_t *buf;
+
+    if (JS_ToInt64(ctx, &sockfd, argv[0]))
+        return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &optname, argv[1]))
+        return JS_EXCEPTION;
+    if (argc > 3 && JS_ToInt32(ctx, &level, argv[3]))
+        return JS_EXCEPTION;
+    buf = JS_GetArrayBuffer(ctx, &size, argv[2]);
+    if (!buf)
+        return JS_EXCEPTION;
+    if (magic) {
+        err = js_get_sockerrno(setsockopt(JS_SOCK(sockfd), level, optname,
+                                          (const char *)buf, (socklen_t)size));
+    } else {
+        socklen_t optlen = (socklen_t)size;
+        err = js_get_sockerrno(getsockopt(JS_SOCK(sockfd), level, optname,
+                                          (char *)buf, &optlen));
+        if (err >= 0)
+            err = optlen;
+    }
+    return JS_NewInt64(ctx, err);
+}
+
+static JSValue js_os_getname(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv, int magic)
+{
+    int64_t sockfd;
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    ssize_t err;
+
+    if (JS_ToInt64(ctx, &sockfd, argv[0]))
+        return JS_EXCEPTION;
+    memset(&addr, 0, sizeof(addr));
+    if (magic)
+        err = js_get_sockerrno(getpeername(JS_SOCK(sockfd), (struct sockaddr *)&addr, &addr_len));
+    else
+        err = js_get_sockerrno(getsockname(JS_SOCK(sockfd), (struct sockaddr *)&addr, &addr_len));
+    if (err < 0)
+        return JS_NewInt64(ctx, err);
+    return JS_ToSockaddrObj(ctx, &addr);
+}
+
+static JSValue js_os_bind(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv)
+{
+    int64_t sockfd;
+    struct sockaddr_storage addr;
+    ssize_t err;
+
+    if (JS_ToInt64(ctx, &sockfd, argv[0]))
+        return JS_EXCEPTION;
+    if (JS_ToSockaddrStruct(ctx, argv[1], &addr, (intptr_t)sockfd))
+        return JS_EXCEPTION;
+    err = js_get_sockerrno(bind(JS_SOCK(sockfd), (struct sockaddr *)&addr,
+                                js_sockaddr_len(&addr)));
+    return JS_NewInt64(ctx, err);
+}
+
+static JSValue js_os_listen(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    int64_t sockfd;
+    int backlog = SOMAXCONN;
+    ssize_t err;
+
+    if (JS_ToInt64(ctx, &sockfd, argv[0]))
+        return JS_EXCEPTION;
+    if (argc > 1 && JS_ToInt32(ctx, &backlog, argv[1]))
+        return JS_EXCEPTION;
+    err = js_get_sockerrno(listen(JS_SOCK(sockfd), backlog));
+    return JS_NewInt64(ctx, err);
+}
+
+static JSValue js_os_shutdown(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    int64_t sockfd;
+    int how;
+    ssize_t err;
+
+    if (JS_ToInt64(ctx, &sockfd, argv[0]))
+        return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &how, argv[1]))
+        return JS_EXCEPTION;
+    err = js_get_sockerrno(shutdown(JS_SOCK(sockfd), how));
+    return JS_NewInt64(ctx, err);
+}
+
+/* accept() and connect() share the promise/handler setup */
+static JSValue js_os_connect_accept(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv, int magic)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    int64_t sockfd;
+    JSOSSockHandler *sh;
+    JSValue promise, resolving_funcs[2], func, retval, val;
+    ssize_t err;
+
+    if (JS_ToInt64(ctx, &sockfd, argv[0]))
+        return JS_EXCEPTION;
+    sh = js_mallocz_rt(rt, sizeof(*sh));
+    if (!sh)
+        return JS_EXCEPTION;
+    sh->sockfd = (intptr_t)sockfd;
+    sh->magic = magic;
+    sh->bufval = JS_NULL;
+    sh->resolve = JS_NULL;
+    sh->reject = JS_NULL;
+
+    if (magic == MAGIC_SOCKET_CONNECT) {
+        struct sockaddr_storage addr;
+        if (JS_ToSockaddrStruct(ctx, argv[1], &addr, (intptr_t)sockfd))
+            goto fail;
+        memcpy(&sh->sockaddr, &addr, sizeof(addr));
+    }
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        goto fail;
+    sh->resolve = JS_DupValue(ctx, resolving_funcs[0]);
+    sh->reject = JS_DupValue(ctx, resolving_funcs[1]);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+
+    if (magic == MAGIC_SOCKET_ACCEPT) {
+        list_add_tail(&sh->link, &ts->os_sock_handlers);
+        return promise;
+    }
+
+    /* CONNECT: immediate success resolves now, in-progress stays pending,
+       immediate failure rejects the promise (never a synchronous throw) */
+    if (connect(JS_SOCK(sockfd), (struct sockaddr *)&sh->sockaddr,
+                js_sockaddr_len(&sh->sockaddr)) == 0) {
+        val = JS_NewInt32(ctx, 0);
+        func = JS_DupValue(ctx, sh->resolve);
+        retval = JS_Call(ctx, func, JS_UNDEFINED, 1, &val);
+        JS_FreeValue(ctx, func);
+        JS_FreeValue(ctx, val);
+        if (JS_IsException(retval))
+            js_std_dump_error(ctx);
+        else
+            JS_FreeValue(ctx, retval);
+        JS_FreeValueRT(rt, sh->resolve);
+        JS_FreeValueRT(rt, sh->reject);
+        js_free_rt(rt, sh);
+        return promise;
+    }
+    err = js_get_sockerrno(-1);
+#if defined(_WIN32)
+    if (err == -WSAEWOULDBLOCK || err == -WSAEINPROGRESS)
+#else
+    if (err == -EINPROGRESS || err == -EAGAIN || err == -EWOULDBLOCK)
+#endif
+    {
+        list_add_tail(&sh->link, &ts->os_sock_handlers);
+        return promise;
+    }
+    val = JS_NewInt64(ctx, err);
+    func = JS_DupValue(ctx, sh->reject);
+    retval = JS_Call(ctx, func, JS_UNDEFINED, 1, &val);
+    JS_FreeValue(ctx, func);
+    JS_FreeValue(ctx, val);
+    if (JS_IsException(retval))
+        js_std_dump_error(ctx);
+    else
+        JS_FreeValue(ctx, retval);
+    JS_FreeValueRT(rt, sh->resolve);
+    JS_FreeValueRT(rt, sh->reject);
+    js_free_rt(rt, sh);
+    return promise;
+fail:
+    JS_FreeValueRT(rt, sh->resolve);
+    JS_FreeValueRT(rt, sh->reject);
+    js_free_rt(rt, sh);
+    return JS_EXCEPTION;
+}
+
+/* recv/send/recvfrom/sendto share buffer/length/offset/flags parsing */
+static JSValue js_os_recv_send(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int magic)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    int64_t sockfd;
+    uint64_t length, offset;
+    size_t size;
+    uint8_t *buf;
+    int flags = 0;
+    JSOSSockHandler *sh;
+    JSValue promise, resolving_funcs[2] = { JS_NULL, JS_NULL };
+    int buf_arg = (magic == MAGIC_SOCKET_SENDTO) ? 2 : 1;
+
+    if (JS_ToInt64(ctx, &sockfd, argv[0]))
+        return JS_EXCEPTION;
+    buf = JS_GetArrayBuffer(ctx, &size, argv[buf_arg]);
+    if (!buf)
+        return JS_EXCEPTION;
+    length = size;
+    offset = 0;
+    if (argc > buf_arg + 1 && !JS_IsUndefined(argv[buf_arg + 1]) &&
+        JS_ToIndex(ctx, &length, argv[buf_arg + 1]))
+        return JS_EXCEPTION;
+    if (argc > buf_arg + 2 && !JS_IsUndefined(argv[buf_arg + 2]) &&
+        JS_ToIndex(ctx, &offset, argv[buf_arg + 2]))
+        return JS_EXCEPTION;
+    if (argc > buf_arg + 3 && !JS_IsUndefined(argv[buf_arg + 3]) &&
+        JS_ToInt32(ctx, &flags, argv[buf_arg + 3]))
+        return JS_EXCEPTION;
+    if (length == 0)
+        return JS_ThrowRangeError(ctx, "length must be greater than 0");
+    if (offset > size)
+        offset = size;
+    if (length > size - offset)
+        length = size - offset;
+
+    sh = js_mallocz_rt(rt, sizeof(*sh));
+    if (!sh)
+        return JS_EXCEPTION;
+    sh->sockfd = (intptr_t)sockfd;
+    sh->magic = magic;
+    sh->flags = flags;
+    sh->length = length;
+    sh->offset = offset;
+    sh->buffer = buf;
+    sh->bufval = JS_DupValue(ctx, argv[buf_arg]);
+    sh->resolve = JS_NULL;
+    sh->reject = JS_NULL;
+    if (magic == MAGIC_SOCKET_SENDTO) {
+        if (JS_ToSockaddrStruct(ctx, argv[1], &sh->sockaddr, (intptr_t)sockfd))
+            goto fail;
+    }
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        goto fail;
+    sh->resolve = JS_DupValue(ctx, resolving_funcs[0]);
+    sh->reject = JS_DupValue(ctx, resolving_funcs[1]);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    list_add_tail(&sh->link, &ts->os_sock_handlers);
+    return promise;
+fail:
+    JS_FreeValue(ctx, sh->bufval);
+    JS_FreeValue(ctx, sh->resolve);
+    JS_FreeValue(ctx, sh->reject);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    js_free_rt(rt, sh);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_os_accept(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    return js_os_connect_accept(ctx, this_val, argc, argv, MAGIC_SOCKET_ACCEPT);
+}
+
+static JSValue js_os_connect(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    return js_os_connect_accept(ctx, this_val, argc, argv, MAGIC_SOCKET_CONNECT);
+}
+
+static JSValue js_os_recv(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv)
+{
+    return js_os_recv_send(ctx, this_val, argc, argv, MAGIC_SOCKET_RECV);
+}
+
+static JSValue js_os_send(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv)
+{
+    return js_os_recv_send(ctx, this_val, argc, argv, MAGIC_SOCKET_SEND);
+}
+
+static JSValue js_os_recvfrom(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    return js_os_recv_send(ctx, this_val, argc, argv, MAGIC_SOCKET_RECVFROM);
+}
+
+static JSValue js_os_sendto(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    return js_os_recv_send(ctx, this_val, argc, argv, MAGIC_SOCKET_SENDTO);
+}
+
+/* parse getaddrinfo hints (flags/family/socktype/service) into a C addrinfo */
+static int js_parse_addrinfo_hints(JSContext *ctx, JSValueConst obj,
+                                   struct addrinfo *hints, const char **service)
+{
+    JSValue val;
+    memset(hints, 0, sizeof(*hints));
+    *service = NULL;
+    if (!JS_IsObject(obj))
+        return 0;
+    val = JS_GetPropertyStr(ctx, obj, "flags");
+    if (!JS_IsUndefined(val)) {
+        uint32_t flags;
+        if (JS_ToUint32(ctx, &flags, val)) {
+            JS_FreeValue(ctx, val);
+            return -1;
+        }
+        hints->ai_flags = flags;
+    }
+    JS_FreeValue(ctx, val);
+    val = JS_GetPropertyStr(ctx, obj, "family");
+    if (!JS_IsUndefined(val) && JS_ToInt32(ctx, &hints->ai_family, val)) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
+    JS_FreeValue(ctx, val);
+    val = JS_GetPropertyStr(ctx, obj, "socktype");
+    if (!JS_IsUndefined(val) && JS_ToInt32(ctx, &hints->ai_socktype, val)) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
+    JS_FreeValue(ctx, val);
+    val = JS_GetPropertyStr(ctx, obj, "service");
+    if (!JS_IsUndefined(val)) {
+        *service = JS_ToCString(ctx, val);
+        if (!*service) {
+            JS_FreeValue(ctx, val);
+            return -1;
+        }
+    }
+    JS_FreeValue(ctx, val);
+    return 0;
+}
+
+static JSValue js_os_getaddrinfo(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    const char *node = NULL, *service = NULL;
+    struct addrinfo hints, *ai = NULL;
+    int ret;
+    JSValue arr;
+
+    if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+        node = JS_ToCString(ctx, argv[0]);
+        if (!node)
+            return JS_EXCEPTION;
+    }
+    memset(&hints, 0, sizeof(hints));
+    if (argc > 1 && js_parse_addrinfo_hints(ctx, argv[1], &hints, &service))
+        goto fail;
+    ret = getaddrinfo(node, service, &hints, &ai);
+    if (ret != 0) {
+        arr = JS_NewInt32(ctx, -ret);
+    } else {
+        arr = js_build_addrinfo_array(ctx, ai);
+    }
+    /* free the whole chain via the head pointer on both paths */
+    if (ai)
+        freeaddrinfo(ai);
+    if (node)
+        JS_FreeCString(ctx, node);
+    if (service)
+        JS_FreeCString(ctx, service);
+    return arr;
+fail:
+    if (node)
+        JS_FreeCString(ctx, node);
+    if (service)
+        JS_FreeCString(ctx, service);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_os_getaddrinfoAsync(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSResolverRequest *req;
+    JSValue promise;
+
+    req = js_mallocz_rt(rt, sizeof(*req));
+    if (!req)
+        return JS_EXCEPTION;
+    req->resolve = JS_NULL;
+    req->reject = JS_NULL;
+    req->type = 0;
+    if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+        const char *node = JS_ToCString(ctx, argv[0]);
+        if (!node)
+            goto fail;
+        req->node = strdup(node);
+        JS_FreeCString(ctx, node);
+        if (!req->node)
+            goto fail;
+    }
+    if (argc > 1) {
+        const char *service = NULL;
+        if (js_parse_addrinfo_hints(ctx, argv[1], &req->hints, &service))
+            goto fail;
+        if (service) {
+            req->service = strdup(service);
+            JS_FreeCString(ctx, service);
+            if (!req->service)
+                goto fail;
+        }
+    }
+    promise = js_resolver_submit(ctx, req);
+    if (JS_IsException(promise))
+        goto fail;
+    return promise;
+fail:
+    js_resolver_request_free(rt, req);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_os_getnameinfo(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    struct sockaddr_storage addr;
+    char host[NI_MAXHOST], serv[NI_MAXSERV];
+    int flags = 0, ret;
+    JSValue obj;
+
+    if (JS_ToSockaddrStruct(ctx, argv[0], &addr, -1))
+        return JS_EXCEPTION;
+    if (argc > 1 && JS_ToInt32(ctx, &flags, argv[1]))
+        return JS_EXCEPTION;
+    ret = getnameinfo((struct sockaddr *)&addr, js_sockaddr_len(&addr),
+                      host, sizeof(host), serv, sizeof(serv), flags);
+    if (ret != 0)
+        return JS_NewInt32(ctx, -ret);
+    obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return obj;
+    JS_DefinePropertyValueStr(ctx, obj, "host", JS_NewString(ctx, host), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, obj, "service", JS_NewString(ctx, serv), JS_PROP_C_W_E);
+    return obj;
+}
+
+static JSValue js_os_getnameinfoAsync(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSResolverRequest *req;
+    JSValue promise;
+
+    req = js_mallocz_rt(rt, sizeof(*req));
+    if (!req)
+        return JS_EXCEPTION;
+    req->resolve = JS_NULL;
+    req->reject = JS_NULL;
+    req->type = 1;
+    if (JS_ToSockaddrStruct(ctx, argv[0], &req->sockaddr, -1))
+        goto fail;
+    if (argc > 1 && JS_ToInt32(ctx, &req->ni_flags, argv[1]))
+        goto fail;
+    promise = js_resolver_submit(ctx, req);
+    if (JS_IsException(promise))
+        goto fail;
+    return promise;
+fail:
+    js_resolver_request_free(rt, req);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_os_gethostname(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    char buf[256];
+    ssize_t err = js_get_sockerrno(gethostname(buf, sizeof(buf)));
+    if (err < 0)
+        return JS_NewInt64(ctx, err);
+    buf[sizeof(buf) - 1] = '\0';
+    return JS_NewString(ctx, buf);
+}
+
+static JSValue js_os_inet_ntop(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    int family;
+    size_t size;
+    uint8_t *buf;
+    char str[INET6_ADDRSTRLEN];
+    const char *res;
+
+    if (JS_ToInt32(ctx, &family, argv[0]))
+        return JS_EXCEPTION;
+    buf = JS_GetArrayBuffer(ctx, &size, argv[1]);
+    if (!buf)
+        return JS_EXCEPTION;
+    if ((family == AF_INET && size < 4) || (family == AF_INET6 && size < 16))
+        return JS_ThrowRangeError(ctx, "address buffer too small");
+    res = inet_ntop(family, buf, str, sizeof(str));
+    if (!res)
+        return JS_NewInt64(ctx, js_get_sockerrno(-1));
+    return JS_NewString(ctx, str);
+}
+
+static JSValue js_os_inet_pton(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    int family, ret;
+    const char *str;
+    uint8_t addr[16];
+    size_t len;
+
+    if (JS_ToInt32(ctx, &family, argv[0]))
+        return JS_EXCEPTION;
+    str = JS_ToCString(ctx, argv[1]);
+    if (!str)
+        return JS_EXCEPTION;
+    if (family != AF_INET && family != AF_INET6) {
+        JS_FreeCString(ctx, str);
+        return JS_ThrowTypeError(ctx, "invalid address family");
+    }
+    len = family == AF_INET ? 4 : 16;
+    ret = inet_pton(family, str, addr);
+    JS_FreeCString(ctx, str);
+    if (ret != 1)
+        return JS_NewInt32(ctx, ret == 0 ? -EINVAL : (int)js_get_sockerrno(-1));
+    return JS_NewArrayBufferCopy(ctx, addr, len);
+}
+
+static JSValue js_os_socketpair(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    int domain = AF_UNIX, type = SOCK_STREAM;
+    intptr_t fds[2];
+    JSValue arr;
+
+    if (argc > 0 && JS_ToInt32(ctx, &domain, argv[0]))
+        return JS_EXCEPTION;
+    if (argc > 1 && JS_ToInt32(ctx, &type, argv[1]))
+        return JS_EXCEPTION;
+#if defined(_WIN32)
+    {
+        SOCKET pair[2];
+        if (js_win_loopback_pair(pair))
+            return JS_NewInt64(ctx, -WSAGetLastError());
+        fds[0] = (intptr_t)pair[0];
+        fds[1] = (intptr_t)pair[1];
+    }
+#else
+    {
+        int pfds[2], i;
+        ssize_t err = js_get_sockerrno(socketpair(domain, type, 0, pfds));
+        if (err < 0)
+            return JS_NewInt64(ctx, err);
+        fds[0] = pfds[0];
+        fds[1] = pfds[1];
+        for (i = 0; i < 2; i++) {
+            int flags = fcntl(pfds[i], F_GETFL, 0);
+            if (flags < 0 || fcntl(pfds[i], F_SETFL, flags | O_NONBLOCK) < 0) {
+                err = -errno;
+                close(pfds[0]);
+                close(pfds[1]);
+                return JS_NewInt64(ctx, err);
+            }
+        }
+    }
+#endif
+    if (js_os_sock_register(rt, fds[0]) < 0) {
+        js_sock_close(fds[0]);
+        js_sock_close(fds[1]);
+        return JS_NewInt64(ctx, -ENOMEM);
+    }
+    if (js_os_sock_register(rt, fds[1]) < 0) {
+        js_os_sock_unregister(rt, fds[0]);
+        js_sock_close(fds[0]);
+        js_sock_close(fds[1]);
+        return JS_NewInt64(ctx, -ENOMEM);
+    }
+    arr = JS_NewArray(ctx);
+    if (JS_IsException(arr))
+        return arr;
+    JS_DefinePropertyValueUint32(ctx, arr, 0, JS_NewInt64(ctx, fds[0]), JS_PROP_C_W_E);
+    JS_DefinePropertyValueUint32(ctx, arr, 1, JS_NewInt64(ctx, fds[1]), JS_PROP_C_W_E);
+    return arr;
+}
+
 #define OS_FLAG(x) JS_PROP_INT32_DEF(#x, x, JS_PROP_CONFIGURABLE )
 
 static const JSCFunctionListEntry js_os_funcs[] = {
@@ -4093,6 +5736,131 @@ static const JSCFunctionListEntry js_os_funcs[] = {
     JS_CFUNC_DEF("dup", 1, js_os_dup ),
     JS_CFUNC_DEF("dup2", 2, js_os_dup2 ),
 #endif
+    /* socket API */
+    JS_CFUNC_DEF("socket", 3, js_os_socket ),
+    JS_CFUNC_DEF("bind", 2, js_os_bind ),
+    JS_CFUNC_DEF("listen", 2, js_os_listen ),
+    JS_CFUNC_DEF("accept", 1, js_os_accept ),
+    JS_CFUNC_DEF("connect", 2, js_os_connect ),
+    JS_CFUNC_DEF("recv", 5, js_os_recv ),
+    JS_CFUNC_DEF("send", 5, js_os_send ),
+    JS_CFUNC_DEF("recvfrom", 5, js_os_recvfrom ),
+    JS_CFUNC_DEF("sendto", 6, js_os_sendto ),
+    JS_CFUNC_DEF("shutdown", 2, js_os_shutdown ),
+    JS_CFUNC_MAGIC_DEF("getsockopt", 4, js_os_get_setsockopt, 0 ),
+    JS_CFUNC_MAGIC_DEF("setsockopt", 4, js_os_get_setsockopt, 1 ),
+    JS_CFUNC_MAGIC_DEF("getsockname", 1, js_os_getname, 0 ),
+    JS_CFUNC_MAGIC_DEF("getpeername", 1, js_os_getname, 1 ),
+    JS_CFUNC_DEF("getaddrinfo", 2, js_os_getaddrinfo ),
+    JS_CFUNC_DEF("getaddrinfoAsync", 2, js_os_getaddrinfoAsync ),
+    JS_CFUNC_DEF("getnameinfo", 2, js_os_getnameinfo ),
+    JS_CFUNC_DEF("getnameinfoAsync", 2, js_os_getnameinfoAsync ),
+    JS_CFUNC_DEF("gethostname", 0, js_os_gethostname ),
+    JS_CFUNC_DEF("inet_ntop", 2, js_os_inet_ntop ),
+    JS_CFUNC_DEF("inet_pton", 2, js_os_inet_pton ),
+    JS_CFUNC_DEF("socketpair", 2, js_os_socketpair ),
+    OS_FLAG(AF_INET),
+    OS_FLAG(AF_INET6),
+    OS_FLAG(SOCK_STREAM),
+    OS_FLAG(SOCK_DGRAM),
+    OS_FLAG(SOCK_RAW),
+    OS_FLAG(SOL_SOCKET),
+    OS_FLAG(SO_REUSEADDR),
+    OS_FLAG(SO_RCVBUF),
+    OS_FLAG(SO_SNDBUF),
+    OS_FLAG(SO_ERROR),
+    OS_FLAG(SO_KEEPALIVE),
+    OS_FLAG(SO_BROADCAST),
+    OS_FLAG(IPPROTO_IP),
+    OS_FLAG(IPPROTO_TCP),
+    OS_FLAG(IPPROTO_UDP),
+    OS_FLAG(IPPROTO_IPV6),
+    OS_FLAG(TCP_NODELAY),
+#if defined(_WIN32)
+    JS_PROP_INT32_DEF("SHUT_RD", SD_RECEIVE, JS_PROP_CONFIGURABLE),
+    JS_PROP_INT32_DEF("SHUT_WR", SD_SEND, JS_PROP_CONFIGURABLE),
+    JS_PROP_INT32_DEF("SHUT_RDWR", SD_BOTH, JS_PROP_CONFIGURABLE),
+#else
+    OS_FLAG(SHUT_RD),
+    OS_FLAG(SHUT_WR),
+    OS_FLAG(SHUT_RDWR),
+#endif
+    /* multicast */
+    OS_FLAG(IP_ADD_MEMBERSHIP),
+    OS_FLAG(IP_DROP_MEMBERSHIP),
+    OS_FLAG(IP_MULTICAST_IF),
+    OS_FLAG(IP_MULTICAST_TTL),
+    OS_FLAG(IP_MULTICAST_LOOP),
+    OS_FLAG(IPV6_JOIN_GROUP),
+    OS_FLAG(IPV6_LEAVE_GROUP),
+    OS_FLAG(IPV6_MULTICAST_IF),
+    OS_FLAG(IPV6_MULTICAST_HOPS),
+    OS_FLAG(IPV6_MULTICAST_LOOP),
+    /* sockopt extensions */
+    OS_FLAG(IPV6_V6ONLY),
+    OS_FLAG(SO_LINGER),
+    OS_FLAG(SO_RCVTIMEO),
+    OS_FLAG(SO_SNDTIMEO),
+    OS_FLAG(SO_ACCEPTCONN),
+    OS_FLAG(SO_TYPE),
+    OS_FLAG(IP_TTL),
+    OS_FLAG(IP_TOS),
+#ifdef SO_REUSEPORT
+    OS_FLAG(SO_REUSEPORT),
+#endif
+#ifdef SO_PROTOCOL
+    OS_FLAG(SO_PROTOCOL),
+#endif
+#ifdef SO_DOMAIN
+    OS_FLAG(SO_DOMAIN),
+#endif
+#ifdef TCP_KEEPIDLE
+    OS_FLAG(TCP_KEEPIDLE),
+#endif
+#ifdef TCP_KEEPINTVL
+    OS_FLAG(TCP_KEEPINTVL),
+#endif
+#ifdef TCP_KEEPCNT
+    OS_FLAG(TCP_KEEPCNT),
+#endif
+    /* MSG_* flags */
+    OS_FLAG(MSG_PEEK),
+    OS_FLAG(MSG_OOB),
+    OS_FLAG(MSG_WAITALL),
+#ifdef MSG_DONTWAIT
+    OS_FLAG(MSG_DONTWAIT),
+#endif
+#ifdef MSG_TRUNC
+    OS_FLAG(MSG_TRUNC),
+#endif
+#ifdef MSG_NOSIGNAL
+    OS_FLAG(MSG_NOSIGNAL),
+#endif
+    /* AI_* hints flags */
+    OS_FLAG(AI_PASSIVE),
+    OS_FLAG(AI_CANONNAME),
+    OS_FLAG(AI_NUMERICHOST),
+    OS_FLAG(AI_NUMERICSERV),
+    OS_FLAG(AI_V4MAPPED),
+    OS_FLAG(AI_ALL),
+    OS_FLAG(AI_ADDRCONFIG),
+    /* NI_* flags */
+    OS_FLAG(NI_NUMERICHOST),
+    OS_FLAG(NI_NUMERICSERV),
+    OS_FLAG(NI_NOFQDN),
+    OS_FLAG(NI_NAMEREQD),
+    OS_FLAG(NI_DGRAM),
+    /* EAI_* error codes */
+    OS_FLAG(EAI_AGAIN),
+    OS_FLAG(EAI_BADFLAGS),
+    OS_FLAG(EAI_FAIL),
+    OS_FLAG(EAI_FAMILY),
+    OS_FLAG(EAI_MEMORY),
+    OS_FLAG(EAI_NONAME),
+    OS_FLAG(EAI_SERVICE),
+    OS_FLAG(EAI_SOCKTYPE),
+    OS_FLAG(EAI_SYSTEM),
+    OS_FLAG(EAI_OVERFLOW),
 };
 
 static int js_os_init(JSContext *ctx, JSModuleDef *m)
@@ -4234,15 +6002,44 @@ void js_std_init_handlers(JSRuntime *rt)
         exit(1);
     }
     memset(ts, 0, sizeof(*ts));
+#if defined(_WIN32)
+    /* Winsock must be up before any waker (loopback socketpair) is created */
+    {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            fprintf(stderr, "Could not initialize Winsock\n");
+            free(ts);
+            exit(1);
+        }
+    }
+#endif
     init_list_head(&ts->os_rw_handlers);
+    init_list_head(&ts->os_sock_handlers);
+    init_list_head(&ts->os_sock_handles);
     init_list_head(&ts->os_signal_handlers);
     init_list_head(&ts->os_timers);
     init_list_head(&ts->port_list);
     init_list_head(&ts->rejected_promise_list);
     ts->next_timer_id = 1;
 
+    /* async DNS resolver: the thread is created lazily on first request */
+    init_list_head(&ts->resolver.pending);
+    init_list_head(&ts->resolver.done);
+    pthread_mutex_init(&ts->resolver.mutex, NULL);
+    pthread_cond_init(&ts->resolver.cond, NULL);
+    atomic_init(&ts->resolver.stop, 0);
+    ts->resolver.started = FALSE;
+    ts->resolver.outstanding = 0;
+
     if (js_waker_init(&ts->atomics_async_waker)) {
         fprintf(stderr, "Could not create atomics_async_waker\n");
+        exit(1);
+    }
+    if (js_waker_init(&ts->resolver.waker)) {
+        fprintf(stderr, "Could not create resolver waker\n");
+        js_waker_close(&ts->atomics_async_waker);
+        pthread_mutex_destroy(&ts->resolver.mutex);
+        pthread_cond_destroy(&ts->resolver.cond);
         exit(1);
     }
     /* Note: could be done once */
@@ -4273,6 +6070,20 @@ void js_std_free_handlers(JSRuntime *rt)
         free_rw_handler(rt, rh);
     }
 
+    /* discard pending socket operations; the runtime is going away */
+    list_for_each_safe(el, el1, &ts->os_sock_handlers) {
+        JSOSSockHandler *sh = list_entry(el, JSOSSockHandler, link);
+        free_sock_handler(rt, sh);
+    }
+
+    /* close every socket owned by this runtime */
+    list_for_each_safe(el, el1, &ts->os_sock_handles) {
+        JSOSockHandle *h = list_entry(el, JSOSockHandle, link);
+        js_sock_close(h->handle);
+        list_del(&h->link);
+        js_free_rt(rt, h);
+    }
+
     list_for_each_safe(el, el1, &ts->os_signal_handlers) {
         JSOSSignalHandler *sh = list_entry(el, JSOSSignalHandler, link);
         free_sh(rt, sh);
@@ -4290,6 +6101,11 @@ void js_std_free_handlers(JSRuntime *rt)
         free(rp);
     }
 
+#if defined(_WIN32)
+    js_stdin_stop(ts);
+#endif
+    js_resolver_stop(rt);
+
 #ifdef USE_WORKER
     js_free_message_pipe(ts->recv_pipe);
     js_free_message_pipe(ts->send_pipe);
@@ -4304,9 +6120,11 @@ void js_std_free_handlers(JSRuntime *rt)
 
     js_waker_close(&ts->atomics_async_waker);
     
-#if !defined(_WIN32)
-    free(ts->poll_fds);
+#if defined(_WIN32)
+    WSACleanup();
 #endif
+
+    free(ts->poll_fds);
 
     free(ts);
     JS_SetRuntimeOpaque(rt, NULL); /* fail safe */

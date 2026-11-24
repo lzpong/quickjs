@@ -1230,6 +1230,13 @@ static ssize_t js_get_sockerrno(ssize_t ret)
     return ret;
 }
 
+/* glibc EAI_* macros are negative, Winsock's positive; normalize to a
+   negative error code, matching the -errno convention */
+static int js_eai_norm(int ret)
+{
+    return ret < 0 ? ret : -ret;
+}
+
 static JSValue js_std_strerror(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
@@ -3607,7 +3614,7 @@ static void *js_resolver_thread(void *arg)
             struct addrinfo *ai = NULL;
             int ret = getaddrinfo(req->node, req->service, &req->hints, &ai);
             req->ai = ai;
-            req->err = ret ? -ret : 0;
+            req->err = ret ? js_eai_norm(ret) : 0;
         } else {
             char host[NI_MAXHOST], serv[NI_MAXSERV];
             socklen_t len = js_sockaddr_len(&req->sockaddr);
@@ -3618,7 +3625,7 @@ static void *js_resolver_thread(void *arg)
                 req->serv = strdup(serv);
                 req->err = (req->host && req->serv) ? 0 : -ENOMEM;
             } else {
-                req->err = -ret;
+                req->err = js_eai_norm(ret);
             }
         }
 
@@ -3694,7 +3701,7 @@ static void js_resolver_drain(JSContext *ctx)
         req = list_entry(el, JSResolverRequest, link);
         pthread_mutex_unlock(&r->mutex);
 
-        if (req->err < 0) {
+        if (req->err != 0) {
             result = JS_NewInt32(ctx, req->err);
         } else if (req->type == 0) {
             result = js_build_addrinfo_array(ctx, req->ai);
@@ -3716,7 +3723,7 @@ static void js_resolver_drain(JSContext *ctx)
                     JS_NewString(ctx, req->serv ? req->serv : ""), JS_PROP_C_W_E);
             }
         }
-        func = JS_DupValue(ctx, req->err < 0 ? req->reject : req->resolve);
+        func = JS_DupValue(ctx, req->err != 0 ? req->reject : req->resolve);
         retval = JS_Call(ctx, func, JS_UNDEFINED, 1, &result);
         JS_FreeValue(ctx, func);
         JS_FreeValue(ctx, result);
@@ -5428,7 +5435,7 @@ static JSValue js_os_getaddrinfo(JSContext *ctx, JSValueConst this_val,
         goto fail;
     ret = getaddrinfo(node, service, &hints, &ai);
     if (ret != 0) {
-        arr = JS_NewInt32(ctx, -ret);
+        arr = JS_NewInt32(ctx, js_eai_norm(ret));
     } else {
         arr = js_build_addrinfo_array(ctx, ai);
     }
@@ -5505,7 +5512,7 @@ static JSValue js_os_getnameinfo(JSContext *ctx, JSValueConst this_val,
     ret = getnameinfo((struct sockaddr *)&addr, js_sockaddr_len(&addr),
                       host, sizeof(host), serv, sizeof(serv), flags);
     if (ret != 0)
-        return JS_NewInt32(ctx, -ret);
+        return JS_NewInt32(ctx, js_eai_norm(ret));
     obj = JS_NewObject(ctx);
     if (JS_IsException(obj))
         return obj;
@@ -5657,6 +5664,8 @@ static JSValue js_os_socketpair(JSContext *ctx, JSValueConst this_val,
 }
 
 #define OS_FLAG(x) JS_PROP_INT32_DEF(#x, x, JS_PROP_CONFIGURABLE )
+/* EAI_* export as positive magnitudes (errors are returned negative) */
+#define OS_EAI(x) JS_PROP_INT32_DEF(#x, ((x) < 0 ? -(x) : (x)), JS_PROP_CONFIGURABLE )
 
 static const JSCFunctionListEntry js_os_funcs[] = {
     JS_CFUNC_DEF("open", 2, js_os_open ),
@@ -5856,16 +5865,20 @@ static const JSCFunctionListEntry js_os_funcs[] = {
     OS_FLAG(NI_NAMEREQD),
     OS_FLAG(NI_DGRAM),
     /* EAI_* error codes */
-    OS_FLAG(EAI_AGAIN),
-    OS_FLAG(EAI_BADFLAGS),
-    OS_FLAG(EAI_FAIL),
-    OS_FLAG(EAI_FAMILY),
-    OS_FLAG(EAI_MEMORY),
-    OS_FLAG(EAI_NONAME),
-    OS_FLAG(EAI_SERVICE),
-    OS_FLAG(EAI_SOCKTYPE),
-    OS_FLAG(EAI_SYSTEM),
-    OS_FLAG(EAI_OVERFLOW),
+    OS_EAI(EAI_AGAIN),
+    OS_EAI(EAI_BADFLAGS),
+    OS_EAI(EAI_FAIL),
+    OS_EAI(EAI_FAMILY),
+    OS_EAI(EAI_MEMORY),
+    OS_EAI(EAI_NONAME),
+    OS_EAI(EAI_SERVICE),
+    OS_EAI(EAI_SOCKTYPE),
+#ifdef EAI_SYSTEM
+    OS_EAI(EAI_SYSTEM),
+#endif
+#ifdef EAI_OVERFLOW
+    OS_EAI(EAI_OVERFLOW),
+#endif
 };
 
 static int js_os_init(JSContext *ctx, JSModuleDef *m)

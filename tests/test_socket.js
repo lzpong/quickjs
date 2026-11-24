@@ -165,7 +165,7 @@ async function test_tcp() {
         assert(cp.port, sa.port);
         const sp = os.getpeername(server);
         assert(sp.addr, "127.0.0.1");
-        assert(sp.port, cp.port);
+        assert(sp.port, os.getsockname(client).port);
         assert(os.getsockname(server).port, sa.port);
 
         /* connect completed with no error */

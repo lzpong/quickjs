@@ -2938,6 +2938,7 @@ static void handle_socket_message(JSContext *ctx, JSOSSockHandler *sh)
     intptr_t newfd = -1;
     struct sockaddr_storage sockaddr;
     socklen_t addr_len = sizeof(sockaddr);
+    int msg_flags = sh->flags;
 
     memset(&sockaddr, 0, sizeof(sockaddr));
 
@@ -2958,20 +2959,26 @@ static void handle_socket_message(JSContext *ctx, JSOSSockHandler *sh)
             sh->length = buflen - sh->offset;
     }
 
+#if defined(_WIN32)
+    /* Non-blocking Winsock sockets reject MSG_WAITALL (WSAEOPNOTSUPP) and cannot
+       block anyway; drop it so recv matches POSIX non-blocking semantics. */
+    msg_flags &= ~MSG_WAITALL;
+#endif
+
     if (sh->magic == MAGIC_SOCKET_RECV) {
         err = js_get_sockerrno(recv(JS_SOCK(sh->sockfd), (char *)sh->buffer + sh->offset,
-                                    JS_SOCK_LEN(sh->length), sh->flags));
+                                    JS_SOCK_LEN(sh->length), msg_flags));
     } else if (sh->magic == MAGIC_SOCKET_SEND) {
         err = js_get_sockerrno(send(JS_SOCK(sh->sockfd), (char *)sh->buffer + sh->offset,
-                                    JS_SOCK_LEN(sh->length), sh->flags));
+                                    JS_SOCK_LEN(sh->length), msg_flags));
     } else if (sh->magic == MAGIC_SOCKET_RECVFROM) {
         err = js_get_sockerrno(recvfrom(JS_SOCK(sh->sockfd), (char *)sh->buffer + sh->offset,
-                                        JS_SOCK_LEN(sh->length), sh->flags,
+                                        JS_SOCK_LEN(sh->length), msg_flags,
                                         (struct sockaddr *)&sockaddr, &addr_len));
     } else if (sh->magic == MAGIC_SOCKET_SENDTO) {
         addr_len = js_sockaddr_len(&sh->sockaddr);
         err = js_get_sockerrno(sendto(JS_SOCK(sh->sockfd), (char *)sh->buffer + sh->offset,
-                                      JS_SOCK_LEN(sh->length), sh->flags,
+                                      JS_SOCK_LEN(sh->length), msg_flags,
                                       (const struct sockaddr *)&sh->sockaddr, addr_len));
     } else if (sh->magic == MAGIC_SOCKET_CONNECT) {
         /* completion (success or failure) is reported by SO_ERROR on both

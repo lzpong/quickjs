@@ -1,5 +1,6 @@
 /* Socket API tests: inet conversion, DNS (sync/async), socketpair, TCP/UDP
-   loopback, MSG_* flags, multicast smoke, close-cancellation and arg parsing.
+   loopback, MSG_* flags, multicast smoke, close-cancellation, argument
+   validation and the error/edge cases of the async operations.
    Every test closes its own sockets; the suite drains the event loop and exits
    naturally on success. A watchdog forces a non-zero exit if anything stalls. */
 import * as std from "std";
@@ -29,6 +30,18 @@ function bufToStr(ab, n) {
 function bytes(ab) {
     return Array.from(new Uint8Array(ab));
 }
+function errno(err) {
+    return std.Error[err];
+}
+/* capture the rejection of a promise instead of throwing */
+async function rejection(p) {
+    try {
+        await p;
+        return null;
+    } catch (e) {
+        return e;
+    }
+}
 
 function test_inet() {
     /* IPv4 round-trip */
@@ -46,10 +59,30 @@ function test_inet() {
     assertArrayEquals(bytes(b6), bytes(os.inet_pton(os.AF_INET6, s6)));
     assert(os.inet_ntop(os.AF_INET6, os.inet_pton(os.AF_INET6, "::1")), "::1");
     /* error paths */
-    assert(os.inet_pton(os.AF_INET, "not-an-ip"), -std.Error.EINVAL);
-    assert(os.inet_pton(os.AF_INET, "1.2.3.4.5"), -std.Error.EINVAL);
+    assert(os.inet_pton(os.AF_INET, "not-an-ip"), -errno("EINVAL"));
+    assert(os.inet_pton(os.AF_INET, "1.2.3.4.5"), -errno("EINVAL"));
     assertThrows(TypeError, () => os.inet_pton(9999, "1.2.3.4"));
     assertThrows(RangeError, () => os.inet_ntop(os.AF_INET, new ArrayBuffer(3)));
+}
+
+function test_errno() {
+    /* the socket errors are exported under their BSD names with the value the
+       socket API reports; the generic ones keep their errno value */
+    for (const name of ["EAGAIN", "EWOULDBLOCK", "EINPROGRESS", "ECONNREFUSED",
+                        "ECONNRESET", "ETIMEDOUT", "EADDRINUSE", "ENOTCONN",
+                        "ENOMEM", "EBADF", "ECANCELED"]) {
+        assert(typeof std.Error[name], "number", name + " is not exported");
+    }
+    for (const name of ["EAI_NONAME", "EAI_SERVICE", "EAI_AGAIN"]) {
+        assert(typeof os[name], "number", name + " is not exported");
+        assert(os[name] > 0, true, name + " must be exported as a positive value");
+    }
+    if (os.platform === "win32") {
+        /* on Windows the BSD names carry the Winsock values */
+        assert(std.Error.ECONNREFUSED, std.Error.WSAECONNREFUSED);
+        assert(std.Error.EWOULDBLOCK, std.Error.WSAEWOULDBLOCK);
+    }
+    assert(typeof os.AF_UNIX, "number");
 }
 
 function test_gethostname() {
@@ -81,19 +114,25 @@ async function test_getaddrinfo() {
     };
     check(os.getaddrinfo("127.0.0.1", hints));
     check(await os.getaddrinfoAsync("127.0.0.1", hints));
+    /* a null node with AI_PASSIVE yields the wildcard address (for bind()) */
+    const passive = os.getaddrinfo(null, {
+        service: "80", family: os.AF_INET, socktype: os.SOCK_STREAM, flags: os.AI_PASSIVE,
+    });
+    assert(Array.isArray(passive), true, "getaddrinfo(null) failed: " + passive);
+    assert(passive[0].addr, "0.0.0.0");
 
     /* unknown service: EAI_SERVICE on POSIX, some stacks report EAI_NONAME */
     const bad = { service: "definitely-not-a-service-12345", socktype: os.SOCK_STREAM };
     const isServiceErr = (r) => r === -os.EAI_SERVICE || r === -os.EAI_NONAME;
     const r = os.getaddrinfo("127.0.0.1", bad);
     assert(isServiceErr(r), true, "expected -EAI_SERVICE/-EAI_NONAME, got " + r);
-    let rej = null;
-    try {
-        await os.getaddrinfoAsync("127.0.0.1", bad);
-    } catch (e) {
-        rej = e;
-    }
+    const rej = await rejection(os.getaddrinfoAsync("127.0.0.1", bad));
     assert(isServiceErr(rej), true, "async expected -EAI_SERVICE/-EAI_NONAME, got " + rej);
+    /* a non-object hint is ignored: no service, hence port 0 */
+    const noHints = os.getaddrinfo("127.0.0.1", undefined);
+    assert(Array.isArray(noHints), true, "getaddrinfo without hints failed: " + noHints);
+    assert(noHints[0].addr, "127.0.0.1");
+    assert(noHints[0].port, 0);
 }
 
 async function test_getnameinfo() {
@@ -105,6 +144,10 @@ async function test_getnameinfo() {
     const ni2 = await os.getnameinfoAsync(addr, flags);
     assert(ni2.host, "127.0.0.1");
     assert(ni2.service, "80");
+    /* the family is taken from the address text when omitted */
+    const v6 = os.getnameinfo({ addr: "::1", port: 80 }, flags);
+    assert(v6.host.toLowerCase(), "::1");
+    assert((await os.getnameinfoAsync({ addr: "127.0.0.1", port: 80 }, flags)).host, "127.0.0.1");
 }
 
 async function test_socketpair() {
@@ -195,6 +238,85 @@ async function test_tcp() {
     }
 }
 
+async function test_tcp_errors() {
+    /* connecting to a closed loopback port rejects with ECONNREFUSED */
+    const probe = os.socket(os.AF_INET, os.SOCK_STREAM);
+    assert(probe >= 0, true, "socket failed: " + probe);
+    assert(os.bind(probe, { family: os.AF_INET, addr: "127.0.0.1", port: 0 }), 0);
+    assert(os.listen(probe, 1), 0);
+    const port = os.getsockname(probe).port;
+    os.close(probe);
+
+    const c = os.socket(os.AF_INET, os.SOCK_STREAM);
+    try {
+        assert(await rejection(os.connect(c, { family: os.AF_INET, addr: "127.0.0.1", port })),
+               -errno("ECONNREFUSED"));
+    } finally {
+        os.close(c);
+    }
+
+    /* writing after the peer closed must report an error (or succeed while
+       the connection winds down) but never terminate the process */
+    const l = os.socket(os.AF_INET, os.SOCK_STREAM);
+    let s = -1, cl = -1;
+    try {
+        assert(os.bind(l, { family: os.AF_INET, addr: "127.0.0.1", port: 0 }), 0);
+        assert(os.listen(l, 1), 0);
+        const lp = os.getsockname(l).port;
+        cl = os.socket(os.AF_INET, os.SOCK_STREAM);
+        const acceptP = os.accept(l);
+        assert(await os.connect(cl, { family: os.AF_INET, addr: "127.0.0.1", port: lp }), 0);
+        [s] = await acceptP;
+        os.close(s);
+        s = -1;
+        const chunk = new ArrayBuffer(1024);
+        for (let i = 0; i < 50; i++) {
+            /* succeed or fail depending on the stack's timing; surviving is
+               what matters (a raised SIGPIPE would end the process here) */
+            await rejection(os.send(cl, chunk, 1024));
+            await os.sleepAsync(5);
+        }
+    } finally {
+        if (s >= 0) os.close(s);
+        if (cl >= 0) os.close(cl);
+        os.close(l);
+    }
+}
+
+async function test_ipv6() {
+    /* the address family is taken from the socket when omitted */
+    const l = os.socket(os.AF_INET6, os.SOCK_STREAM);
+    if (l < 0) {
+        console.log("SKIP: ipv6 (no AF_INET6 socket)");
+        return;
+    }
+    let c = -1, s = -1;
+    try {
+        if (os.bind(l, { addr: "::1", port: 0 }) < 0 || os.listen(l, 1) < 0) {
+            console.log("SKIP: ipv6 (::1 not available)");
+            return;
+        }
+        const port = os.getsockname(l).port;
+        const acceptP = os.accept(l);
+        c = os.socket(os.AF_INET6, os.SOCK_STREAM);
+        assert(c >= 0, true, "ipv6 client socket failed: " + c);
+        assert(await os.connect(c, { addr: "::1", port }), 0);
+        [s] = await acceptP;
+        assert(s >= 0, true, "ipv6 accept failed: " + s);
+        const peer = os.getpeername(c);
+        assert(peer.family, os.AF_INET6);
+        assert(peer.addr.toLowerCase(), "::1");
+        assert(peer.port, port);
+        assert(await os.send(c, strToBuf("6"), 1), 1);
+        const b = new ArrayBuffer(1);
+        assert(await os.recv(s, b, 1), 1);
+    } finally {
+        if (c >= 0) os.close(c);
+        if (s >= 0) os.close(s);
+        os.close(l);
+    }
+}
+
 async function test_udp() {
     const s1 = os.socket(os.AF_INET, os.SOCK_DGRAM);
     const s2 = os.socket(os.AF_INET, os.SOCK_DGRAM);
@@ -231,23 +353,18 @@ async function test_msg_flags() {
     try {
         const msg = strToBuf("0123456789");
         assert(await os.send(b, msg, 10), 10);
-        /* let the bytes land so MSG_WAITALL completes without blocking */
+        /* let the bytes land so the reads below do not have to wait */
         await os.sleepAsync(50);
-        /* Probe each flag independently (PEEK never consumes the bytes), so a
-           single run reports both outcomes even if one or both reject. */
+
+        /* PEEK reads without consuming */
         const pb = new ArrayBuffer(10);
-        let pn;
-        try { pn = await os.recv(a, pb, 10, 0, os.MSG_PEEK); }
-        catch (e) { pn = "throw " + e; console.log(e.message,e.stack); }
-        console.log("MSG_PEEK:", pn, "data:", bufToStr(pb, 10));
-        const wb = new ArrayBuffer(10);
-        let wn;
-        try { wn = await os.recv(a, wb, 10, 0, os.MSG_WAITALL); }
-        catch (e) { wn = "throw " + e; console.log(e.message,e.stack); }
-        console.log("MSG_WAITALL:", wn, "data:", bufToStr(wb, 10));
-        assert(pn, 10);
+        assert(await os.recv(a, pb, 10, 0, os.MSG_PEEK), 10);
         assert(bufToStr(pb, 10), "0123456789");
-        assert(wn, 10);
+
+        /* WAITALL still sees all 10 bytes (peek did not consume them), read
+           don't need a loop until the requested count has arrived */
+        const wb = new ArrayBuffer(10);
+        assert(await os.recv(a, wb, 10, 0, os.MSG_WAITALL), 10);
         assert(bufToStr(wb, 10), "0123456789");
     } finally {
         os.close(a);
@@ -316,7 +433,7 @@ async function test_close_cancel() {
     const done = os.recv(a, new ArrayBuffer(8), 8).catch(e => { caught = e; });
     os.close(a);
     await done;
-    assert(caught, -std.Error.ECANCELED);
+    assert(caught, -errno("ECANCELED"));
     os.close(b);
 
     /* same for a pending accept on a listening socket */
@@ -328,7 +445,37 @@ async function test_close_cancel() {
     const done2 = os.accept(l).catch(e => { caught2 = e; });
     os.close(l);
     await done2;
-    assert(caught2, -std.Error.ECANCELED);
+    assert(caught2, -errno("ECANCELED"));
+}
+
+async function test_bad_handle() {
+    /* a handle that is negative or unknown to the runtime can never become
+       ready: the promise fails right away instead of staying pending (which
+       would keep the event loop alive) or being polled (which could wedge the
+       whole event loop on Windows) */
+    const buf = new ArrayBuffer(8);
+    const addr = { addr: "127.0.0.1", port: 9 };
+    for (const h of [-1, 0x40000000]) {
+        for (const op of [
+            () => os.accept(h),
+            () => os.connect(h, addr),
+            () => os.recv(h, buf),
+            () => os.send(h, buf),
+            () => os.recvfrom(h, buf),
+            () => os.sendto(h, addr, buf),
+        ]) {
+            assert(await rejection(op()), -errno("EBADF"));
+        }
+    }
+    /* a closed handle drops out of the runtime's registry */
+    const pair = os.socketpair();
+    assert(Array.isArray(pair), true, "socketpair failed: " + pair);
+    os.close(pair[0]);
+    assert(await rejection(os.recv(pair[0], buf)), -errno("EBADF"));
+    assert(await rejection(os.connect(pair[0], addr)), -errno("EBADF"));
+    os.close(pair[1]);
+    assert(os.close(-1), -errno("EBADF"));
+    assert(os.close(0x100000000), -errno("EBADF")); /* beyond the CRT fd range */
 }
 
 async function test_args() {
@@ -336,22 +483,87 @@ async function test_args() {
     assert(Array.isArray(pair), true, "socketpair failed: " + pair);
     const [a, b] = pair;
     try {
-        /* length == 0 is a synchronous RangeError on all four ops */
-        assertThrows(RangeError, () => os.recv(a, new ArrayBuffer(8), 0));
-        assertThrows(RangeError, () => os.send(a, new ArrayBuffer(8), 0));
-        assertThrows(RangeError, () => os.recvfrom(a, new ArrayBuffer(8), 0));
-        assertThrows(RangeError, () => os.sendto(a, { addr: "127.0.0.1", port: 1 }, new ArrayBuffer(8), 0));
+        const buf = new ArrayBuffer(8);
+        const addr = { addr: "127.0.0.1", port: 9 };
+
         /* buffers must be ArrayBuffer, not a TypedArray view */
         assertThrows(TypeError, () => os.recv(a, new Uint8Array(8), 8));
 
-        /* length clamps to the buffer size; offset+length clamp to the tail */
+        /* offset and offset+length must lie inside the buffer */
+        assertThrows(RangeError, () => os.send(a, buf, 9));
+        assertThrows(RangeError, () => os.send(a, buf, 5, 4));
+        assertThrows(RangeError, () => os.send(a, buf, undefined, 9));
+        assertThrows(RangeError, () => os.recv(a, buf, 9));
+        assertThrows(RangeError, () => os.recv(a, buf, 5, 4));
+        assertThrows(RangeError, () => os.recv(a, buf, undefined, 9));
+        assertThrows(RangeError, () => os.recvfrom(a, buf, 9));
+        assertThrows(RangeError, () => os.sendto(a, addr, buf, 9));
+        assertThrows(RangeError, () => os.sendto(a, addr, buf, undefined, 9));
+
+        /* an empty recv is refused: 0 means end of stream */
+        assertThrows(RangeError, () => os.recv(a, buf, 0));
+        assertThrows(RangeError, () => os.recvfrom(a, buf, 0));
+        assertThrows(RangeError, () => os.recv(a, new ArrayBuffer(0)));
+
+        /* an empty send completes with 0 right away and sends nothing */
+        assert(await os.send(b, buf, 0), 0);
+        assert(await os.send(b, new ArrayBuffer(0)), 0);
+        assert(await os.send(b, buf, undefined, 8), 0); /* offset at the end */
+        assert(await os.sendto(b, addr, new ArrayBuffer(0)), 0);
+
+        /* length defaults to the rest of the buffer from offset */
         const msg = strToBuf("abcdef");
-        assert(await os.send(b, msg, 100), 6);
-        const rb = new ArrayBuffer(8);
-        assert(await os.recv(a, rb, 100, 6), 2);
-        const u = new Uint8Array(rb);
+        assert(await os.send(b, msg, msg.byteLength), 6);
+        assert(await os.recv(a, buf, undefined, 6), 2);
+        const u = new Uint8Array(buf);
         assert(u[6], "a".charCodeAt(0));
         assert(u[7], "b".charCodeAt(0));
+        assert(await os.recv(a, buf, 4, 4), 4);
+        assert(bufToStr(buf.slice(4), 4), "cdef");
+
+        /* explicit undefined arguments mean "not given" */
+        const other = os.socket(os.AF_INET, os.SOCK_STREAM, undefined);
+        assert(other >= 0, true, "socket failed: " + other);
+        assert(os.getsockopt(other, os.SO_TYPE, new ArrayBuffer(4), undefined), 4);
+        os.close(other);
+        const p2 = os.socketpair(undefined, undefined);
+        assert(Array.isArray(p2), true, "socketpair(undefined) failed: " + p2);
+        os.close(p2[0]);
+        os.close(p2[1]);
+    } finally {
+        os.close(a);
+        os.close(b);
+    }
+}
+
+async function test_buffer_lifetime() {
+    /* the buffer of a pending operation is re-validated when the socket is
+       ready: a detached buffer or a shrunken range fails with -EINVAL */
+    const pair = os.socketpair();
+    assert(Array.isArray(pair), true, "socketpair failed: " + pair);
+    const [a, b] = pair;
+    try {
+        const buf = new ArrayBuffer(16, { maxByteLength: 32 });
+        if (typeof buf.resize === "function") {
+            /* the range must still fit once the socket is ready */
+            const p = os.recv(a, buf, 16);
+            buf.resize(8);
+            assert(await os.send(b, strToBuf("x"), 1), 1);
+            assert(await rejection(p), -errno("EINVAL"));
+            /* a range that still fits is not affected */
+            buf.resize(16);
+            const q = os.recv(a, buf, 8);
+            buf.resize(12);
+            assert(await os.send(b, strToBuf("y"), 1), 1);
+            assert(await q, 1);
+        }
+        if (typeof buf.transfer === "function") {
+            /* "y" is still queued, so the detached buffer is looked at right away */
+            const detached = new ArrayBuffer(8);
+            const p = os.recv(a, detached, 8);
+            detached.transfer();
+            assert(await rejection(p), -errno("EINVAL"));
+        }
     } finally {
         os.close(a);
         os.close(b);
@@ -361,16 +573,21 @@ async function test_args() {
 async function main() {
     const tests = [
         ["inet", test_inet],
+        ["errno", test_errno],
         ["gethostname", test_gethostname],
         ["getaddrinfo", test_getaddrinfo],
         ["getnameinfo", test_getnameinfo],
         ["socketpair", test_socketpair],
         ["tcp", test_tcp],
+        ["tcp_errors", test_tcp_errors],
+        ["ipv6", test_ipv6],
         ["udp", test_udp],
         ["msg_flags", test_msg_flags],
         ["multicast", test_multicast],
         ["close_cancel", test_close_cancel],
+        ["bad_handle", test_bad_handle],
         ["args", test_args],
+        ["buffer_lifetime", test_buffer_lifetime],
     ];
     for (const [name, fn] of tests) {
         console.log("RUN:", name);
@@ -382,7 +599,7 @@ main().then(() => {
     os.clearTimeout(watchdog);
     /* all sockets closed and no pending ops: the loop drains and exits 0 */
 }, (e) => {
-    console.log("FAIL: test_socket.js:", e && e.message ? e.message : e);
+    console.log("FAIL: test_socket.js:", e?.message);
     if (e && e.stack)
         console.log(e.stack);
     std.exit(1);

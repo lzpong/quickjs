@@ -1,6 +1,8 @@
 /**
  * Provides Operating System specific functions:
  * file access, sockets, signals, timers, async I/O, workers (threads)
+ * The socket functions and constants (from `socket` on) are only exported when
+ * the socket API is built in (`USE_NETWORK`, the default).
  */
 declare module "os" {
 	type Success = 0;
@@ -23,7 +25,11 @@ declare module "os" {
 	type PollRet = Branded<number, "PollRet">;
 	type WaitpidOpt = Branded<number, "WaitpidOpt">;
 	type FileDescriptor = Branded<number, "FileDescriptor">;
-	/** A socket handle. Valid only within the runtime (thread) that created it. */
+	/**
+	 * A socket handle. Valid only within the runtime (thread) that created it,
+	 * and only until it is closed. The async operations reject a handle that is
+	 * not a live socket of this runtime with `-EBADF` right away.
+	 */
 	type SocketHandle = Branded<number, "SocketHandle">;
 	type Signal = Branded<number, "Signal">;
 	type StatMode = Branded<number, "StatMode">;
@@ -86,7 +92,7 @@ declare module "os" {
 		port: number;
 		/** Numeric IP string @example "8.8.8.8" or "::1" */
 		addr: string;
-		/** Defaults to the socket's family (getsockname), or AF_INET. */
+		/** Defaults to the socket family, or (without a socket, e.g. getnameinfo) to the family of `addr`. */
 		family?: SocketFamily;
 	}
 	/**
@@ -160,6 +166,8 @@ declare module "os" {
 	export const WNOHANG: WaitpidOpt;
 	export const AF_INET: SocketFamily;
 	export const AF_INET6: SocketFamily;
+	/** Not exported where the socket headers lack AF_UNIX (some Windows SDKs). */
+	export const AF_UNIX: SocketFamily;
 	export const SOCK_STREAM: SocketType;
 	export const SOCK_DGRAM: SocketType;
 	export const SOCK_RAW: SocketType;
@@ -209,6 +217,7 @@ declare module "os" {
 	/* recv/send flags */
 	export const MSG_PEEK: MsgFlags;
 	export const MSG_OOB: MsgFlags;
+	/** Ignored on Windows: non-blocking Winsock sockets reject it. */
 	export const MSG_WAITALL: MsgFlags;
 	/* POSIX-only recv/send flags */
 	export const MSG_DONTWAIT: MsgFlags;
@@ -228,7 +237,10 @@ declare module "os" {
 	export const NI_NOFQDN: NameInfoFlags;
 	export const NI_NAMEREQD: NameInfoFlags;
 	export const NI_DGRAM: NameInfoFlags;
-	/* getaddrinfo/getnameinfo error codes (returned negated) */
+	/* getaddrinfo/getnameinfo error codes (returned negated). Compare against
+	   these constants, never hard-coded numbers: on POSIX they share the numeric
+	   space with the errno values, on Windows they carry Winsock values (the
+	   WSA* names) like the other socket errors */
 	export const EAI_AGAIN: Errno;
 	export const EAI_BADFLAGS: Errno;
 	export const EAI_FAIL: Errno;
@@ -241,9 +253,9 @@ declare module "os" {
 	export const EAI_OVERFLOW: Errno;
 	/** string representing the platform. */
 	export const platform: Platform;
-	/** Open a file. Return a handle or `< 0` if error. */
+	/** Open a file. `flags` defaults to read-only. Return a handle or `< 0` if error. */
 	export function open(filename: string, flags?: OpenOption, mode?: number): Result<FileDescriptor>;
-	/** Close a file handle or socket. For sockets, pending operations are cancelled (reject `-ECANCELED`). */
+	/** Close a file handle or socket. For sockets, pending operations are cancelled (reject `-ECANCELED`). An out-of-range file handle returns `-EBADF`. */
 	export function close(fd: FileDescriptor | SocketHandle): Result<Success>;
 	/** Seek in the file. Use `std.SEEK_*` for whence */
 	export function seek(fd: FileDescriptor, offset: number, whence: number): Result<number>;
@@ -316,23 +328,28 @@ declare module "os" {
 	export function now(): number;
 	/** Sleep during `delay_ms` milliseconds. */
 	export function sleep(delay_ms: number): Result<number>;
-	/** Sleep during `delay_ms` milliseconds. */
-	export function sleepAsync(delay_ms: number): Promise<Result<number>>;
+	/** Sleep during `delay_ms` milliseconds. Resolves to `undefined`. */
+	export function sleepAsync(delay_ms: number): Promise<undefined>;
 	/** Call the function func after `delay` ms. */
 	export function setTimeout(func: Callback, delay: number): TimerHandle;
 	/** Cancel a timer. */
 	export function clearTimeout(handle: TimerHandle): void;
 	/** Create a non-blocking socket. `protocol` defaults to 0. */
 	export function socket(family: SocketFamily, type: SocketType, protocol?: number): Result<SocketHandle>;
-	/** Get a socket option into `data`. Returns the number of bytes written (>=0) or `-errno`. `level` defaults to `SOL_SOCKET`. @example os.getsockopt(sock, os.SO_RCVBUF, new Uint32Array(1).buffer) */
+	/** Get a socket option, stored into `data`. Returns the number of bytes written (>=0) or `-errno`. `level` defaults to `SOL_SOCKET`. @example os.getsockopt(sock, os.SO_RCVBUF, new Uint32Array(1).buffer) */
 	export function getsockopt(sockfd: SocketHandle, name: SocketOpt, data: ArrayBuffer, level?: SocketLevel): Result<number>;
 	/** Set a socket option from `data`. `level` defaults to `SOL_SOCKET`. For multicast membership use an ArrayBuffer of exactly the option size (e.g. 8 bytes for ip_mreq). @example os.setsockopt(sock, os.SO_REUSEADDR, new Uint32Array([1]).buffer) */
 	export function setsockopt(sockfd: SocketHandle, name: SocketOpt, data: ArrayBuffer, level?: SocketLevel): Result<Success>;
-	/** Get address information for a given node and/or service @example os.getaddrinfo("localhost", {family:os.AF_INET6}) */
-	export function getaddrinfo(node: string, hint?: HintAddr): Result<Array<SocketAddrInfo>>;
-	/** Non-blocking getaddrinfo() resolved on a worker thread. Rejects with `-EAI_*` on error. */
-	export function getaddrinfoAsync(node: string, hint?: HintAddr): Promise<Array<SocketAddrInfo>>;
-	/** Reverse-resolve a sockaddr to host/service names. `flags` are NI_*. */
+	/**
+	 * Get address information for a given node and/or service. A `null` node
+	 * with the AI_PASSIVE flag yields the wildcard address to bind to.
+	 * Returns `-EAI_*` on error.
+	 * @example os.getaddrinfo("localhost", {service: "80", socktype: os.SOCK_STREAM})
+	 */
+	export function getaddrinfo(node: string | null | undefined, hint?: HintAddr): Result<Array<SocketAddrInfo>>;
+	/** Non-blocking getaddrinfo() resolved on a worker thread. Rejects with `-EAI_*` on error. Requests are served one at a time, so a slow lookup delays the ones queued behind it. */
+	export function getaddrinfoAsync(node: string | null | undefined, hint?: HintAddr): Promise<Array<SocketAddrInfo>>;
+	/** Reverse-resolve a sockaddr to host/service names. `flags` are NI_*. Returns `-EAI_*` on error. */
 	export function getnameinfo(addr: SocketAddr, flags?: NameInfoFlags): Result<NameInfo>;
 	/** Non-blocking getnameinfo() resolved on a worker thread. Rejects with `-EAI_*` on error. */
 	export function getnameinfoAsync(addr: SocketAddr, flags?: NameInfoFlags): Promise<NameInfo>;
@@ -342,7 +359,7 @@ declare module "os" {
 	export function inet_ntop(family: SocketFamily, addr: ArrayBuffer): Result<string>;
 	/** Convert an address string to a binary ArrayBuffer (4 bytes for AF_INET, 16 for AF_INET6). */
 	export function inet_pton(family: SocketFamily, addr: string): Result<ArrayBuffer>;
-	/** Create a pair of connected sockets. POSIX uses socketpair(domain, type); Windows ignores the arguments and returns a loopback TCP pair. `domain` defaults to AF_UNIX, `type` to SOCK_STREAM. */
+	/** Create a pair of connected non-blocking sockets. POSIX uses socketpair(domain, type); Windows ignores the arguments and returns a loopback TCP pair. `domain` defaults to AF_UNIX, `type` to SOCK_STREAM. */
 	export function socketpair(domain?: SocketFamily, type?: SocketType): Result<[SocketHandle, SocketHandle]>;
 	/** Get current address to which the socket sockfd is bound */
 	export function getsockname(sockfd: SocketHandle): Result<SocketAddr>;
@@ -353,18 +370,46 @@ declare module "os" {
 	/** Mark `sockfd` as passive socket that will `accept()` a `backlog` number of incoming connection (SOMAXCONN by default). */
 	export function listen(sockfd: SocketHandle, backlog?: number): Result<Success>;
 	/** Shut down part of a full-duplex connection */
-	export function shutdown(sockfd: SocketHandle, type: SocketShutOpt): Result<Success>;
-	/** Accept incoming connections. Resolves `[remotefd, remoteaddr]`, rejects with `-errno` on error. */
+	export function shutdown(sockfd: SocketHandle, how: SocketShutOpt): Result<Success>;
+	/**
+	 * Accept incoming connections. Resolves `[remotefd, remoteaddr]`, rejects
+	 * with `-errno` on error. A failed accept (e.g. -EMFILE) ends the pending
+	 * request: call accept() again to go on.
+	 */
 	export function accept(sockfd: SocketHandle): Promise<[remotefd: SocketHandle, remoteaddr: SocketAddr]>;
-	/** Connect `sockfd` to `addr`. Resolves 0 on success, rejects with `-errno` on error. */
+	/**
+	 * Connect `sockfd` to `addr`. Resolves 0 on success, rejects with `-errno`
+	 * on error (never a synchronous throw).
+	 */
 	export function connect(sockfd: SocketHandle, addr: SocketAddr): Promise<Success>;
-	/** Send up to `length` bytes from `buffer` (starting at byte `offset`) on `sockfd`. `flags` are MSG_*. Resolves bytes sent, rejects with `-errno` on error. */
+	/**
+	 * Send up to `length` bytes from `buffer` (starting at byte `offset`) on
+	 * `sockfd`. `flags` are MSG_*. Resolves bytes sent, rejects with `-errno`.
+	 *
+	 * `length` defaults to the rest of the buffer from `offset`. The range
+	 * `offset .. offset+length` must lie inside the buffer, otherwise a
+	 * RangeError is thrown. A `length` of 0 sends nothing and resolves to 0.
+	 * While the operation is pending the buffer may be detached or resized:
+	 * the operation then rejects with `-EINVAL` if the range no longer fits.
+	 * On POSIX a closed peer never raises SIGPIPE: the error is `-EPIPE`.
+	 */
 	export function send(sockfd: SocketHandle, buffer: ArrayBuffer, length?: number, offset?: number, flags?: MsgFlags): Promise<number>;
-	/** Receive up to `length` bytes into `buffer` (starting at byte `offset`) from `sockfd`. `flags` are MSG_*. Resolves bytes received (0 on EOF), rejects with `-errno` on error. */
+	/**
+	 * Receive up to `length` bytes into `buffer` (starting at byte `offset`)
+	 * from `sockfd`. `flags` are MSG_*. Resolves bytes received, 0 on EOF;
+	 * rejects with `-errno`. Same range rules as send(), except that a
+	 * `length` of 0 is refused (RangeError) because 0 means end of stream.
+	 */
 	export function recv(sockfd: SocketHandle, buffer: ArrayBuffer, length?: number, offset?: number, flags?: MsgFlags): Promise<number>;
-	/** Send up to `length` bytes from `buffer` (starting at byte `offset`) on `sockfd` to `addr`. `flags` are MSG_*. Resolves bytes sent, rejects with `-errno` on error. */
+	/**
+	 * Send up to `length` bytes from `buffer` (starting at byte `offset`) on
+	 * `sockfd` to `addr`. Same rules as send().
+	 */
 	export function sendto(sockfd: SocketHandle, addr: SocketAddr, buffer: ArrayBuffer, length?: number, offset?: number, flags?: MsgFlags): Promise<number>;
-	/** Receive up to `length` bytes into `buffer` (starting at byte `offset`) from `sockfd`. `flags` are MSG_*. Resolves `[bytesReceived, remoteAddr]`, rejects with `-errno` on error. */
+	/**
+	 * Receive up to `length` bytes into `buffer` (starting at byte `offset`)
+	 * from `sockfd`. Same rules as recv(). Resolves `[bytesReceived, remoteAddr]`.
+	 */
 	export function recvfrom(sockfd: SocketHandle, buffer: ArrayBuffer, length?: number, offset?: number, flags?: MsgFlags): Promise<[total: number, from: SocketAddr]>;
 
 	export class Worker {

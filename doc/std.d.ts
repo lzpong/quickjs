@@ -4,7 +4,7 @@
 declare module "std" {
 	type Branded<T, B> = T & { __brand: B };
 	type FileDescriptor = Branded<number, "FileDescriptor">;
-	/** errno values. Socket APIs on Windows report Winsock codes; EAGAIN/EWOULDBLOCK/EINPROGRESS carry their Winsock values there. Compare against these constants, never hard-coded numbers. */
+	/** errno values. On Windows the socket API reports Winsock values, so the socket errors below carry them there (same values as the WSAE* names). Compare against these constants, never hard-coded numbers. */
 	interface StdError {
 		EINVAL: number;
 		EIO: number;
@@ -18,14 +18,40 @@ declare module "std" {
 		EPIPE: number;
 		EBADF: number;
 		ECANCELED: number;
+		ENOMEM: number;
+		EMFILE: number;
+		EINTR: number;
+		/* socket errors, exported when the socket API is built in (USE_NETWORK) */
 		EAGAIN: number;
 		EWOULDBLOCK: number;
 		EINPROGRESS: number;
-		/* Windows-only Winsock aliases */
+		ECONNREFUSED: number;
+		ECONNRESET: number;
+		ECONNABORTED: number;
+		ETIMEDOUT: number;
+		EADDRINUSE: number;
+		EADDRNOTAVAIL: number;
+		ENOTCONN: number;
+		ENOTSOCK: number;
+		ENETUNREACH: number;
+		ENETDOWN: number;
+		EHOSTUNREACH: number;
+		EOPNOTSUPP: number;
+		ESHUTDOWN: number;
+		EMSGSIZE: number;
+		EISCONN: number;
+		EALREADY: number;
+		EAFNOSUPPORT: number;
+		EPROTONOSUPPORT: number;
+		ENOPROTOOPT: number;
+		ENOBUFS: number;
+		EFAULT: number;
+		/* Windows-only Winsock names */
 		WSAEWOULDBLOCK: number;
 		WSAEINPROGRESS: number;
 		WSAECONNREFUSED: number;
 		WSAECONNRESET: number;
+		WSAECONNABORTED: number;
 		WSAETIMEDOUT: number;
 		WSAEADDRINUSE: number;
 		WSAEADDRNOTAVAIL: number;
@@ -34,10 +60,17 @@ declare module "std" {
 		WSAEINVAL: number;
 		WSAEFAULT: number;
 		WSAENETUNREACH: number;
+		WSAENETDOWN: number;
 		WSAEHOSTUNREACH: number;
 		WSAEOPNOTSUPP: number;
 		WSAESHUTDOWN: number;
 		WSAEMSGSIZE: number;
+		WSAEISCONN: number;
+		WSAEALREADY: number;
+		WSAEAFNOSUPPORT: number;
+		WSAEPROTONOSUPPORT: number;
+		WSAENOPROTOOPT: number;
+		WSAENOBUFS: number;
 	}
 	export const Error: StdError;
 	export const SEEK_SET: number;

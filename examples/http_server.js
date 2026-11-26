@@ -38,9 +38,11 @@ async function sendAll(fd, buffer) {
     }
 }
 /** Read lines from a socket with a large buffer (not one byte per recv).
+ * Overlong lines are refused so that a client cannot grow the buffer at will.
  * @param {os.SocketHandle} fd */
 async function* recvLines(fd) {
     const chunk = new Uint8Array(4096);
+    const MAX_LINE = 16 * 1024;
     let buf = '';
     for (;;) {
         const n = await os.recv(fd, chunk.buffer);
@@ -51,6 +53,7 @@ async function* recvLines(fd) {
             yield buf.slice(0, idx).replace(/\r$/, '');
             buf = buf.slice(idx + 1);
         }
+        if (buf.length > MAX_LINE) throw new Error("header line too long");
     }
     if (buf) yield buf.replace(/\r$/, '');
 }
@@ -58,7 +61,7 @@ async function* recvLines(fd) {
  * @param {os.SocketHandle} fd @param {string} status @param {string[]} headers @param {number} length */
 async function sendHead(fd, status, headers, length) {
     const head = Uint8Array.from(
-        [status, ...headers, `Content-Length: ${length}`, 'Connection: close', '', ''].join('\r\n'),
+        [`HTTP/1.1 ${status}`, ...headers, `Content-Length: ${length}`, 'Connection: close', '', ''].join('\r\n'),
         c => c.charCodeAt(0));
     await sendAll(fd, head.buffer);
 }
@@ -71,14 +74,15 @@ async function sendResponse(fd, status, headers, body) {
 }
 //USAGE: qjs http_server.js [PORT=8080 [HOST=localhost]]
 const [port = "8080", host = "localhost"] = scriptArgs.slice(1);
-const [ai] = must(os.getaddrinfo(host, { service: port }));
+const [ai] = must(os.getaddrinfo(host, { service: port, socktype: os.SOCK_STREAM }));
 const sock_srv = must(os.socket(ai.family, ai.socktype));
 must(os.setsockopt(sock_srv, os.SO_REUSEADDR, new Uint32Array([1]).buffer));
 must(os.bind(sock_srv, ai));
 must(os.listen(sock_srv));
-// closing the listening socket cancels the pending accept() (rejects it),
-// which breaks the loop below
-os.signal(os.SIGINT, () => os.close(sock_srv));
+// closing the listening socket cancels the pending accept() (rejects it) and
+// stops the loop below, also while a connection is being served
+let closing = false;
+os.signal(os.SIGINT, () => { closing = true; os.close(sock_srv); });
 console.log(`Listening on http://${host}:${port} (${ai.addr}:${ai.port}) ...`);
 if (os.exec) {
     const url = `http://${host}:${port}`;
@@ -89,14 +93,22 @@ if (os.exec) {
         if (openCmd) os.exec([openCmd, url], { block: false });
     }
 }
-const baseDir = os.realpath('.')[0];
+// only serve files below the current directory; the trailing separator makes
+// the prefix test work when the current directory is the filesystem root
 const sep = os.platform === 'win32' ? '\\' : '/';
+const baseDir = os.realpath('.')[0];
+const basePrefix = baseDir.endsWith(sep) ? baseDir : baseDir + sep;
 for (;;) {
     let sock_cli;
     try {
         [sock_cli] = await os.accept(sock_srv);
     } catch (e) {
-        break; // listening socket closed (e.g. SIGINT)
+        if (closing)
+            break;
+        // transient failure (e.g. out of file descriptors): retry shortly
+        console.log('accept failed:', std.strerror(-e));
+        await os.sleepAsync(100);
+        continue;
     }
     try {
         const lines = recvLines(sock_cli);
@@ -119,7 +131,7 @@ for (;;) {
         }
         // resolve symlinks and refuse to serve anything outside the base dir
         const [real, rerr] = os.realpath(safe_path);
-        const outside = rerr || !(real === baseDir || real.startsWith(baseDir + sep));
+        const outside = rerr || !(real === baseDir || real.startsWith(basePrefix));
         if (err) {
             await sendResponse(sock_cli, '404 Not Found', ['Content-Type: text/plain'], `${safe_path}\nerrno:${err}`);
         } else if (outside) {

@@ -46,6 +46,11 @@ endif
 ifndef CONFIG_M32
 CONFIG_TEMPORAL_INTL=y
 endif
+# socket API of the 'os' module (os.socket .. os.socketpair). Build with
+# CONFIG_NETWORK=n to leave it out
+ifndef CONFIG_NETWORK
+CONFIG_NETWORK=y
+endif
 
 # installation directory
 PREFIX?=/usr/local
@@ -171,6 +176,11 @@ endif
 endif
 ifdef CONFIG_TEMPORAL_INTL
 DEFINES+=-DCONFIG_TEMPORAL_INTL
+endif
+ifeq ($(CONFIG_NETWORK),y)
+DEFINES+=-DUSE_NETWORK=1
+else
+DEFINES+=-DUSE_NETWORK=0
 endif
 
 CFLAGS+=$(DEFINES)
@@ -476,7 +486,9 @@ test: qjs$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_bigint.js
 	$(WINE) ./qjs$(EXE) tests/test_cyclic_import.js
 	$(WINE) ./qjs$(EXE) tests/test_worker.js
+ifeq ($(CONFIG_NETWORK),y)
 	$(WINE) ./qjs$(EXE) tests/test_socket.js
+endif
 ifndef CONFIG_WIN32
 	$(WINE) ./qjs$(EXE) tests/test_std.js
 	$(WINE) ./qjs$(EXE) tests/test_rw_handler.js

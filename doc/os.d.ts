@@ -27,8 +27,8 @@ declare module "os" {
 	type FileDescriptor = Branded<number, "FileDescriptor">;
 	/**
 	 * A socket handle. Valid only within the runtime (thread) that created it,
-	 * and only until it is closed. The async operations reject a handle that is
-	 * not a live socket of this runtime with `-EBADF` right away.
+	 * and only until it is closed. Any socket operation reports a handle that
+	 * is not a live socket of this runtime with `-EBADF` right away.
 	 */
 	type SocketHandle = Branded<number, "SocketHandle">;
 	type Signal = Branded<number, "Signal">;
@@ -216,6 +216,7 @@ declare module "os" {
 	export const SHUT_RDWR: SocketShutOpt;
 	/* recv/send flags */
 	export const MSG_PEEK: MsgFlags;
+	/** Reading out-of-band data is POSIX-only: Windows has no POLLPRI in WSAPoll, so MSG_OOB recv is rejected with `-EOPNOTSUPP` there (send with MSG_OOB works). */
 	export const MSG_OOB: MsgFlags;
 	/** Ignored on Windows: non-blocking Winsock sockets reject it. */
 	export const MSG_WAITALL: MsgFlags;
@@ -336,9 +337,9 @@ declare module "os" {
 	export function clearTimeout(handle: TimerHandle): void;
 	/** Create a non-blocking socket. `protocol` defaults to 0. */
 	export function socket(family: SocketFamily, type: SocketType, protocol?: number): Result<SocketHandle>;
-	/** Get a socket option, stored into `data`. Returns the number of bytes written (>=0) or `-errno`. `level` defaults to `SOL_SOCKET`. @example os.getsockopt(sock, os.SO_RCVBUF, new Uint32Array(1).buffer) */
+	/** Get a socket option, stored into `data`. Returns the number of bytes written (>=0) or `-errno`. `level` defaults to `SOL_SOCKET`. An empty `data` is rejected with `-EINVAL`. @example os.getsockopt(sock, os.SO_RCVBUF, new Uint32Array(1).buffer) */
 	export function getsockopt(sockfd: SocketHandle, name: SocketOpt, data: ArrayBuffer, level?: SocketLevel): Result<number>;
-	/** Set a socket option from `data`. `level` defaults to `SOL_SOCKET`. For multicast membership use an ArrayBuffer of exactly the option size (e.g. 8 bytes for ip_mreq). @example os.setsockopt(sock, os.SO_REUSEADDR, new Uint32Array([1]).buffer) */
+	/** Set a socket option from `data`. `level` defaults to `SOL_SOCKET`. An empty `data` is rejected with `-EINVAL`. For multicast membership use an ArrayBuffer of exactly the option size (e.g. 8 bytes for ip_mreq). @example os.setsockopt(sock, os.SO_REUSEADDR, new Uint32Array([1]).buffer) */
 	export function setsockopt(sockfd: SocketHandle, name: SocketOpt, data: ArrayBuffer, level?: SocketLevel): Result<Success>;
 	/**
 	 * Get address information for a given node and/or service. A `null` node
@@ -347,7 +348,7 @@ declare module "os" {
 	 * @example os.getaddrinfo("localhost", {service: "80", socktype: os.SOCK_STREAM})
 	 */
 	export function getaddrinfo(node: string | null | undefined, hint?: HintAddr): Result<Array<SocketAddrInfo>>;
-	/** Non-blocking getaddrinfo() resolved on a worker thread. Rejects with `-EAI_*` on error. Requests are served one at a time, so a slow lookup delays the ones queued behind it. */
+	/** Non-blocking getaddrinfo() resolved on a worker thread. Rejects with `-EAI_*` on error. Requests are served one at a time, so a slow lookup delays the ones queued behind it. Destroying the runtime while a lookup is in flight waits for it to return (bounded by the resolver's own timeout). */
 	export function getaddrinfoAsync(node: string | null | undefined, hint?: HintAddr): Promise<Array<SocketAddrInfo>>;
 	/** Reverse-resolve a sockaddr to host/service names. `flags` are NI_*. Returns `-EAI_*` on error. */
 	export function getnameinfo(addr: SocketAddr, flags?: NameInfoFlags): Result<NameInfo>;

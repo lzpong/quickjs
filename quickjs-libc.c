@@ -123,6 +123,7 @@ typedef WSAPOLLFD js_pollfd;
 #define JS_WAKER_READ_FD(w) ((intptr_t)(w).read_sock)
 #define JS_EAGAIN WSAEWOULDBLOCK
 #define JS_EALREADY WSAEALREADY
+#define JS_EOPNOTSUPP WSAEOPNOTSUPP
 #define JS_SOCK_INPROGRESS(err) ((err) == -WSAEWOULDBLOCK || (err) == -WSAEINPROGRESS)
 #define JS_SOCK_WOULDBLOCK(err) ((err) == -WSAEWOULDBLOCK)
 #else
@@ -132,6 +133,7 @@ typedef struct pollfd js_pollfd;
 #define JS_WAKER_READ_FD(w) ((intptr_t)(w).read_fd)
 #define JS_EAGAIN EAGAIN
 #define JS_EALREADY EALREADY
+#define JS_EOPNOTSUPP EOPNOTSUPP
 #define JS_SOCK_INPROGRESS(err) ((err) == -EINPROGRESS || (err) == -EAGAIN || \
                                  (err) == -EWOULDBLOCK)
 #define JS_SOCK_WOULDBLOCK(err) ((err) == -EAGAIN || (err) == -EWOULDBLOCK)
@@ -3208,7 +3210,9 @@ static int js_poll_add_poll_fd(JSThreadState *ts, int *pnfds, intptr_t fd, int e
 #if USE_NETWORK
 /* readiness mask for a pending socket operation; CONNECT watches both
    directions and resolves via SO_ERROR, errors arrive as POLLERR/HUP.
-   Out-of-band data is reported as POLLPRI, not POLLIN */
+   OOB data is reported as POLLPRI, not POLLIN; WSAPoll has no POLLPRI
+   (the whole call fails with WSAEINVAL), so on Windows OOB recvs are
+   refused up front (see js_os_recv_send) and plain POLLIN is enough. */
 static int js_sock_poll_events(JSOSSockHandler *sh)
 {
     switch (sh->magic) {
@@ -3218,7 +3222,11 @@ static int js_sock_poll_events(JSOSSockHandler *sh)
     case MAGIC_SOCKET_CONNECT:
         return POLLIN | POLLOUT;
     default: /* RECV / RECVFROM / ACCEPT */
+#if defined(_WIN32)
+        return POLLIN;
+#else
         return (sh->flags & MSG_OOB) ? (POLLIN | POLLPRI) : POLLIN;
+#endif
     }
 }
 
@@ -3935,7 +3943,14 @@ static void js_resolver_drain(JSContext *ctx)
     }
 }
 
-/* stop the resolver thread and free any leftover requests (free_handlers) */
+/* stop the resolver thread and free any leftover requests (free_handlers).
+   A lookup in flight keeps pthread_join waiting until the blocking
+   getaddrinfo/getnameinfo returns (bounded by its timeout). The CLI is
+   unaffected: the loop only exits with resolver.outstanding == 0 and
+   std.exit() never reaches here; embedded hosts destroying a runtime
+   mid-lookup pay that bounded wait (orphaning the thread instead would
+   leak the waker/mutex/cond and the JSResolver, which lives inside
+   JSThreadState). */
 static void js_resolver_stop(JSRuntime *rt)
 {
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
@@ -3943,6 +3958,9 @@ static void js_resolver_stop(JSRuntime *rt)
     struct list_head *el, *el1;
 
     if (r->started) {
+        if (r->outstanding != 0)
+            fprintf(stderr, "resolver stop: waiting for %d in-flight DNS "
+                    "request(s)\n", r->outstanding);
         atomic_store(&r->stop, 1);
         pthread_mutex_lock(&r->mutex);
         pthread_cond_broadcast(&r->cond);
@@ -5285,6 +5303,8 @@ static JSValue js_os_socket(JSContext *ctx, JSValueConst this_val,
 static JSValue js_os_get_setsockopt(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv, int magic)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     int optname, level = SOL_SOCKET;
     int64_t sockfd;
     ssize_t err;
@@ -5293,6 +5313,9 @@ static JSValue js_os_get_setsockopt(JSContext *ctx, JSValueConst this_val,
 
     if (JS_ToInt64(ctx, &sockfd, argv[0]))
         return JS_EXCEPTION;
+    /* unknown handles report -EBADF, same as the async operations */
+    if (!js_os_sock_lookup(ts, (intptr_t)sockfd))
+        return JS_NewInt32(ctx, -EBADF);
     if (JS_ToInt32(ctx, &optname, argv[1]))
         return JS_EXCEPTION;
     if (argc > 3 && !JS_IsUndefined(argv[3]) && JS_ToInt32(ctx, &level, argv[3]))
@@ -5300,6 +5323,10 @@ static JSValue js_os_get_setsockopt(JSContext *ctx, JSValueConst this_val,
     buf = JS_GetArrayBuffer(ctx, &size, argv[2]);
     if (!buf)
         return JS_EXCEPTION;
+    if (size == 0) {
+        /* empty buffers are silently ignored by some stacks: make it an error */
+        return JS_NewInt32(ctx, -EINVAL);
+    }
     if (magic) {
         err = js_get_sockerrno(setsockopt(JS_SOCK(sockfd), level, optname,
                                           (const char *)buf, (socklen_t)size));
@@ -5316,6 +5343,8 @@ static JSValue js_os_get_setsockopt(JSContext *ctx, JSValueConst this_val,
 static JSValue js_os_getname(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int magic)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     int64_t sockfd;
     struct sockaddr_storage addr;
     socklen_t addr_len = sizeof(addr);
@@ -5323,6 +5352,9 @@ static JSValue js_os_getname(JSContext *ctx, JSValueConst this_val,
 
     if (JS_ToInt64(ctx, &sockfd, argv[0]))
         return JS_EXCEPTION;
+    /* unknown handles report -EBADF, same as the async operations */
+    if (!js_os_sock_lookup(ts, (intptr_t)sockfd))
+        return JS_NewInt32(ctx, -EBADF);
     memset(&addr, 0, sizeof(addr));
     if (magic)
         err = js_get_sockerrno(getpeername(JS_SOCK(sockfd), (struct sockaddr *)&addr, &addr_len));
@@ -5336,12 +5368,17 @@ static JSValue js_os_getname(JSContext *ctx, JSValueConst this_val,
 static JSValue js_os_bind(JSContext *ctx, JSValueConst this_val,
                           int argc, JSValueConst *argv)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     int64_t sockfd;
     struct sockaddr_storage addr;
     ssize_t err;
 
     if (JS_ToInt64(ctx, &sockfd, argv[0]))
         return JS_EXCEPTION;
+    /* unknown handles report -EBADF, same as the async operations */
+    if (!js_os_sock_lookup(ts, (intptr_t)sockfd))
+        return JS_NewInt32(ctx, -EBADF);
     if (JS_ToSockaddrStruct(ctx, argv[1], &addr, (intptr_t)sockfd))
         return JS_EXCEPTION;
     err = js_get_sockerrno(bind(JS_SOCK(sockfd), (struct sockaddr *)&addr,
@@ -5352,12 +5389,17 @@ static JSValue js_os_bind(JSContext *ctx, JSValueConst this_val,
 static JSValue js_os_listen(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     int64_t sockfd;
     int backlog = SOMAXCONN;
     ssize_t err;
 
     if (JS_ToInt64(ctx, &sockfd, argv[0]))
         return JS_EXCEPTION;
+    /* unknown handles report -EBADF, same as the async operations */
+    if (!js_os_sock_lookup(ts, (intptr_t)sockfd))
+        return JS_NewInt32(ctx, -EBADF);
     if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &backlog, argv[1]))
         return JS_EXCEPTION;
     err = js_get_sockerrno(listen(JS_SOCK(sockfd), backlog));
@@ -5367,12 +5409,17 @@ static JSValue js_os_listen(JSContext *ctx, JSValueConst this_val,
 static JSValue js_os_shutdown(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     int64_t sockfd;
     int how;
     ssize_t err;
 
     if (JS_ToInt64(ctx, &sockfd, argv[0]))
         return JS_EXCEPTION;
+    /* unknown handles report -EBADF, same as the async operations */
+    if (!js_os_sock_lookup(ts, (intptr_t)sockfd))
+        return JS_NewInt32(ctx, -EBADF);
     if (JS_ToInt32(ctx, &how, argv[1]))
         return JS_EXCEPTION;
     err = js_get_sockerrno(shutdown(JS_SOCK(sockfd), how));
@@ -5502,6 +5549,14 @@ static JSValue js_os_recv_send(JSContext *ctx, JSValueConst this_val,
     if (argc > buf_arg + 3 && !JS_IsUndefined(argv[buf_arg + 3]) &&
         JS_ToInt32(ctx, &flags, argv[buf_arg + 3]))
         return JS_EXCEPTION;
+#if defined(_WIN32)
+    if (!is_send && (flags & MSG_OOB)) {
+        /* WSAPoll has no POLLPRI: watching POLLIN instead would starve the
+           loop on spurious readiness (only in-band data readable), so OOB
+           recvs are refused; urgent data is POSIX-only here */
+        return js_promise_settled(ctx, TRUE, -JS_EOPNOTSUPP);
+    }
+#endif
     /* length defaults to the rest of the buffer from offset */
     if (!has_length)
         length = offset < size ? size - offset : 0;

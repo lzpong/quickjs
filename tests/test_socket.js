@@ -372,6 +372,49 @@ async function test_msg_flags() {
     }
 }
 
+async function test_msg_oob() {
+    /* urgent data over TCP loopback: POSIX reads the urgent byte out of
+       band; Windows rejects MSG_OOB recvs with -EOPNOTSUPP (no POLLPRI in
+       WSAPoll) and the loop must stay healthy afterwards */
+    const l = os.socket(os.AF_INET, os.SOCK_STREAM);
+    assert(l >= 0, true, "socket failed: " + l);
+    let c = -1, s = -1;
+    try {
+        assert(os.bind(l, { family: os.AF_INET, addr: "127.0.0.1", port: 0 }), 0);
+        assert(os.listen(l, 1), 0);
+        const port = os.getsockname(l).port;
+        const acceptP = os.accept(l);
+        c = os.socket(os.AF_INET, os.SOCK_STREAM);
+        assert(await os.connect(c, { family: os.AF_INET, addr: "127.0.0.1", port }), 0);
+        [s] = await acceptP;
+        assert(await os.send(c, strToBuf("A"), 1, 0, os.MSG_OOB), 1);
+        await os.send(c, strToBuf("BC"), 2);
+        /* let both directions land before reading */
+        await os.sleepAsync(50);
+        if (os.platform === "win32") {
+            /* refused up front; the loop must stay healthy afterwards */
+            assert(await rejection(os.recv(s, new ArrayBuffer(1), 1, 0, os.MSG_OOB)),
+                   -errno("EOPNOTSUPP"));
+            /* the urgent byte went out of band and is not readable here,
+               the in-band stream only carries "BC" */
+            const ib = new ArrayBuffer(2);
+            assert(await os.recv(s, ib, 2), 2);
+            assert(bufToStr(ib, 2), "BC");
+        } else {
+            const ob = new ArrayBuffer(1);
+            assert(await os.recv(s, ob, 1, 0, os.MSG_OOB), 1);
+            assert(bufToStr(ob, 1), "A");
+            const ib = new ArrayBuffer(2);
+            assert(await os.recv(s, ib, 2), 2);
+            assert(bufToStr(ib, 2), "BC");
+        }
+    } finally {
+        if (c >= 0) os.close(c);
+        if (s >= 0) os.close(s);
+        os.close(l);
+    }
+}
+
 async function test_multicast() {
     let sock = os.socket(os.AF_INET, os.SOCK_DGRAM);
     if (sock < 0) {
@@ -583,6 +626,7 @@ async function main() {
         ["ipv6", test_ipv6],
         ["udp", test_udp],
         ["msg_flags", test_msg_flags],
+        ["msg_oob", test_msg_oob],
         ["multicast", test_multicast],
         ["close_cancel", test_close_cancel],
         ["bad_handle", test_bad_handle],

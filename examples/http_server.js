@@ -148,11 +148,15 @@ for (;;) {
             const mime = MIMES.get(safe_path.split('.').at(-1) || '') || MIMES.get('');
             await sendHead(sock_cli, '200 OK', [`Content-Type: ${mime}`], obj.size);
             const fd = must(os.open(safe_path));
-            const fbuf = new Uint8Array(4096);
-            for (let got = 0; (got = os.read(fd, fbuf.buffer, 0, fbuf.byteLength)) > 0;) {
-                await sendAll(sock_cli, fbuf.buffer.slice(0, got));
+            try {
+                const fbuf = new Uint8Array(4096);
+                for (let got = 0; (got = os.read(fd, fbuf.buffer, 0, fbuf.byteLength)) > 0;) {
+                    await sendAll(sock_cli, fbuf.buffer.slice(0, got));
+                }
+            } finally {
+                // a client disconnect makes sendAll throw: close the file anyway
+                os.close(fd);
             }
-            os.close(fd);
         }
     } catch (e) {
         // ignore client errors / disconnects

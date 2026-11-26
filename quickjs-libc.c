@@ -2010,7 +2010,10 @@ static const JSCFunctionListEntry js_std_error_props[] = {
     JS_PROP_INT32_DEF("EAGAIN", WSAEWOULDBLOCK, JS_PROP_CONFIGURABLE),
     DEF(WSAEINVAL),
 #else
-#define SOCK_ERRNO(x) DEF(x)
+    /* the argument is stringized here, before it gets macro-expanded: routed
+       through DEF(x) the parameter would expand first (e.g. EAGAIN -> 11) and
+       the property name would end up being the numeric value */
+#define SOCK_ERRNO(x) JS_PROP_INT32_DEF(#x, x, JS_PROP_CONFIGURABLE)
     SOCK_ERRNO(EAGAIN),
 #endif
     SOCK_ERRNO(EWOULDBLOCK),
